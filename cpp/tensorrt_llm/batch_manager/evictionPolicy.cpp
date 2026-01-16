@@ -103,6 +103,16 @@ bool LRUEvictionPolicy::verifyQueueIntegrity()
     return !queueCompromised;
 }
 
+bool LRUEvictionPolicy::isBlockFree(BlockPtr const& block) const
+{
+    auto const id = block->getBlockId();
+    if (id < 0 || static_cast<size_t>(id) >= mFreeBlockIterators.size())
+    {
+        return false;
+    }
+    return mFreeBlockIterators[id] != std::nullopt;
+}
+
 std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel)
 {
     for (SizeType32 level = 0; level < kMaxPriority - kMinPriority + 1; level++)

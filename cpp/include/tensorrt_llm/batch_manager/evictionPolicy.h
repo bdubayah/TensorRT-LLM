@@ -54,6 +54,9 @@ public:
     virtual void refresh() = 0;
 
     virtual bool verifyQueueIntegrity() = 0;
+
+    /// @brief Check if a block is currently in a free queue
+    virtual bool isBlockFree(BlockPtr const& block) const = 0;
 };
 
 struct ExpiringBlockComparator
@@ -90,6 +93,8 @@ public:
     [[nodiscard]] virtual std::chrono::steady_clock::time_point::duration getTime() const;
 
     bool verifyQueueIntegrity() override;
+
+    bool isBlockFree(BlockPtr const& block) const override;
 
 private:
     // Queues of available leaf blocks, split by cache level and priority level
