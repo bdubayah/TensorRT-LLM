@@ -36,7 +36,7 @@ def should_use_separate_draft_kv_cache(spec_config) -> bool:
         return False
     if not spec_config.spec_dec_mode.use_one_engine():
         return False
-    return spec_config._allow_separate_draft_kv_cache
+    return spec_config.allow_separate_draft_kv_cache
 
 
 def prepare_attn_metadata_for_draft_replay(attn_metadata,

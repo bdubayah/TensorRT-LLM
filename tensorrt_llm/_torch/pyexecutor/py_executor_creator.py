@@ -366,7 +366,7 @@ def create_py_executor(
         # Disable separate draft KV cache in disaggregated mode
         # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
         if cache_transceiver_config is not None:
-            spec_config._allow_separate_draft_kv_cache = False
+            spec_config.allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(

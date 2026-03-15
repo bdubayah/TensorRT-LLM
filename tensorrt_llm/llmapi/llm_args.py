@@ -764,7 +764,7 @@ class DecodingBaseConfig(StrictBaseModel):
     # Internal: record decoding_type alias used during parsing (for warnings).
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
     # If set, drafting will use separate KV cache in one-model speculative decoding.
-    _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
+    allow_separate_draft_kv_cache: bool = True
     # Internal: true when draft_len_schedule was auto-translated from max_concurrency.
     _translated_from_max_concurrency: bool = PrivateAttr(False)
 
