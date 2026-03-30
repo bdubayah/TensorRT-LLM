@@ -86,7 +86,8 @@ std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
     return sequenceBlocks;
 }
 
-SizeType32 getMaterializedUniqueTokenCountForReuse(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest)
+SizeType32 getMaterializedUniqueTokenCountForReuse(
+    VecUniqueTokens const& uniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
 {
     auto const totalUniqueTokenCount = static_cast<SizeType32>(uniqueTokens.size());
     if (llmRequest.getContextRemainingLength() > 0)
@@ -96,7 +97,8 @@ SizeType32 getMaterializedUniqueTokenCountForReuse(VecUniqueTokens const& unique
     return totalUniqueTokenCount;
 }
 
-SizeType32 getUsableUniqueTokenCountForReuse(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest)
+SizeType32 getUsableUniqueTokenCountForReuse(
+    VecUniqueTokens const& uniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
 {
     auto const materializedUniqueTokenCount = getMaterializedUniqueTokenCountForReuse(uniqueTokens, llmRequest);
     return materializedUniqueTokenCount > 0 ? materializedUniqueTokenCount - 1 : 0;
