@@ -168,20 +168,20 @@ class CudaGraphConfig(StrictBaseModel):
         """
         if enable_padding:
             batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
+            while batch_sizes[-1] + 64 <= max_batch_size:
+                batch_sizes.append(batch_sizes[-1] + 64)
         else:
             batch_sizes = list(range(1, 32)) + [32, 64, 128]
+            batch_sizes += [
+                2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
+            ]
 
-        # Add powers of 2 up to max_batch_size
-        batch_sizes += [
-            2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
-        ]
-
-        # Filter and sort batch sizes
+        # Filter and sort batch sizes for both branches
         batch_sizes = sorted(
             [size for size in batch_sizes if size <= max_batch_size])
 
         # Add max_batch_size if not already included
-        if max_batch_size != batch_sizes[-1]:
+        if not batch_sizes or max_batch_size != batch_sizes[-1]:
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
@@ -2119,6 +2119,12 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Whether partially matched blocks that are in use can be reused after copying them."
     )
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    enable_tp_mla_replicated_host_offload: bool = Field(
+        default=False,
+        description=
+        "Whether to enable replicated host offload for MLA models in plain tensor parallel mode. "
+        "Only supported by the Pytorch backend with the KV cache manager v1.")
     use_uvm: bool = Field(default=False,
                           description="Whether to use UVM for the KV cache.")
     max_gpu_total_bytes: NonNegativeInt = Field(
@@ -2193,6 +2199,33 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
+
+    @model_validator(mode="after")
+    def validate_tp_mla_replicated_host_offload(self):
+        if not self.enable_tp_mla_replicated_host_offload:
+            return self
+
+        if self.enable_partial_reuse:
+            raise ValueError(
+                "kv_cache_config.enable_tp_mla_replicated_host_offload does not support "
+                "kv_cache_config.enable_partial_reuse=True")
+
+        if self.use_kv_cache_manager_v2:
+            raise ValueError(
+                "kv_cache_config.enable_tp_mla_replicated_host_offload is only supported with "
+                "kv_cache_config.use_kv_cache_manager_v2=False")
+
+        if self.host_cache_size is None or self.host_cache_size <= 0:
+            raise ValueError(
+                "kv_cache_config.enable_tp_mla_replicated_host_offload requires "
+                "kv_cache_config.host_cache_size > 0")
+
+        if not self.onboard_blocks:
+            raise ValueError(
+                "kv_cache_config.enable_tp_mla_replicated_host_offload requires "
+                "kv_cache_config.onboard_blocks=True")
+
+        return self
 
     @field_validator('free_gpu_memory_fraction')
     @classmethod
@@ -3154,6 +3187,10 @@ class TrtLlmArgs(BaseLlmArgs):
     @model_validator(mode="after")
     def validate_kv_cache_dtype(self):
         assert self.kv_cache_config.dtype == "auto", "KvCacheConfig.dtype is not supported by the TensorRT backend."
+        if self.kv_cache_config.enable_tp_mla_replicated_host_offload:
+            raise ValueError(
+                "kv_cache_config.enable_tp_mla_replicated_host_offload is only supported by the PyTorch backend."
+            )
         return self
 
 

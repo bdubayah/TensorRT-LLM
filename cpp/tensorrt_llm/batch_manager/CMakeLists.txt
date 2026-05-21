@@ -56,6 +56,7 @@ set(SRCS
     rnnCacheTransBuffer.cpp
     runtimeBuffers.cpp
     sequenceSlotManager.cpp
+    tpHostOffloadTopology.cpp
     transformerBuffers.cpp
     trtEncoderModel.cpp
     trtGptModelInflightBatching.cpp

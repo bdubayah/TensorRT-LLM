@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -528,7 +528,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                  std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
                  nvinfer1::DataType, SizeType32, int64_t, runtime::SizeType32, bool, bool, tbk::CacheType,
                  std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32>(),
+                 bool, bool, bool, std::vector<SizeType32> const&, std::shared_ptr<tbc::KvCacheConnectorManager>, bool,
+                 SizeType32, SizeType32>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("temp_attention_window_inputs").none(), nb::arg("dtype"),
@@ -536,7 +537,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("enable_block_reuse") = false, nb::arg("onboard_blocks") = true,
             nb::arg("cache_type") = tbk::CacheType::kSELF, nb::arg("secondary_offload_min_priority") = std::nullopt,
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
-            nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
+            nb::arg("copy_on_partial_reuse") = true, nb::arg("enable_tp_mla_replicated_host_offload") = false,
+            nb::arg("tp_group_ranks") = std::vector<SizeType32>{}, nb::arg("kv_connector_manager") = nullptr,
             nb::arg("enable_indexer_k_cache") = false, nb::arg("indexer_k_cache_quant_block_size") = 128,
             nb::arg("indexer_k_cache_index_head_dim") = 0, nb::call_guard<nb::gil_scoped_release>())
         .def(
