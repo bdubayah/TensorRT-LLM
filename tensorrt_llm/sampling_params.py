@@ -291,6 +291,9 @@ class SamplingParams:
     # Currently, _stream_interval is only used to pass llm.args.stream_interval to tokenizer.
     # TODO: make this a per-request parameter.
     _stream_interval: Optional[int] = field(default=None, init=False, repr=False)
+    dynamic_temperature_rules: Optional[List[Tuple[List[int], float]]] = field(
+        default=None, repr=False
+    )
 
     def __post_init__(self):
         if self.pad_id is None:

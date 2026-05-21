@@ -429,16 +429,21 @@ class SpecMetadata:
         top_ks = []
         top_ps = []
 
-        # Need to use a very small value for temperature when disabled to avoid division by 0
-        DISABLE_TEMP_VAL = 1e-5
+        # A zero temperature marks greedy rows. Sampling code clamps only for
+        # division, then overrides sampled tokens with argmax for these rows.
+        GREEDY_TEMP_VAL = 0.0
+        DEFAULT_TEMP_VAL = 1.0
         # Very large values disable topk.
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
 
         for request in requests:
             sampling_config = request.sampling_config
-            temp = sampling_config.temperature
-            temp_val = temp[0] if temp is not None and len(temp) > 0 else None
+            temp_val = getattr(request, "py_dynamic_temperature_override", None)
+            if temp_val is None:
+                temp = sampling_config.temperature
+                temp_val = temp[0] if temp is not None and len(
+                    temp) > 0 else None
 
             tk = sampling_config.top_k
             tk_val = tk[0] if tk is not None and len(tk) > 0 else None
@@ -455,7 +460,8 @@ class SpecMetadata:
                 top_p=tp_val,
                 use_beam_search=False)
 
-            temp_val = DISABLE_TEMP_VAL if is_greedy or temp_val is None or temp_val == 0 else temp_val
+            temp_val = GREEDY_TEMP_VAL if is_greedy or temp_val == 0 else (
+                DEFAULT_TEMP_VAL if temp_val is None else temp_val)
             tk_val = DISABLE_TOPK_VAL if is_greedy or tk_val is None or tk_val <= 0 else tk_val
             tp_val = DISABLE_TOPP_VAL if is_greedy or tp_val is None else tp_val
 

@@ -187,6 +187,9 @@ class Sampler(ABC, Generic[GenericSampleState]):
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests) -> None:
         pass
 
+    def finalize_sample_state_for_next_forward(self, state: GenericSampleState) -> None:
+        pass
+
     def get_cache_indirection(self) -> torch.Tensor | None:
         return None
 
@@ -405,7 +408,12 @@ def _get_max_beam_width(request: LlmRequest) -> int:
 
 def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     sampling_config = request.sampling_config
-    temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
+    dynamic_temperature_override = request.py_dynamic_temperature_override
+    temperature: Optional[float]
+    if dynamic_temperature_override is not None:
+        temperature = dynamic_temperature_override
+    else:
+        temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
     top_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p))
     top_k = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_k))
     beam_width_out = _get_beam_width_out(request)
@@ -537,6 +545,21 @@ class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
 
         # 1) Slots pre-recorded for recompute (context-phase or beam search)
         recompute_batch_slots = store.slots_needing_recompute & active_slots
+
+        # 1b) Requests whose sampling params changed mid-generation
+        #     (only dynamic_temperature today) advertise this by nulling
+        #     request.py_sampling_strategy — force those slots to recompute.
+        #     Gated on py_dynamic_temperature_rules so batches without any
+        #     dynamic-temperature requests skip the strategy check.
+        for batch_index, slot in enumerate(seq_slots_list):
+            req = requests_list[batch_index]
+            if (
+                req.py_dynamic_temperature_rules is not None
+                and slot not in recompute_batch_slots
+                and req.py_sampling_strategy is None
+            ):
+                store.slots_needing_recompute.add(slot)
+                recompute_batch_slots.add(slot)
 
         # 2) Non-greedy slots where draft-token status may have changed
         #    (For greedy: current_has_draft is always False, matching cached, so never stale)

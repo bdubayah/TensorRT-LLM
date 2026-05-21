@@ -783,6 +783,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
+        self.py_dynamic_temperature_rules = kwargs.pop(
+            "py_dynamic_temperature_rules", None)
+        self.py_dynamic_temperature_suffix_tokens = None
+        self.py_dynamic_temperature_max_rule_len = 0
+        self.py_dynamic_temperature_override: float | None = None
         if llm_request is not None:
             super().__init__(llm_request)
         else:
@@ -862,6 +867,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logprobs_mode = LogprobMode(
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
+
+        self._initialize_dynamic_temperature_state()
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
@@ -1015,6 +1022,47 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         """CPP finish by reason does not support beam_width > 1"""
         self.state = LlmRequestState.GENERATION_COMPLETE
         self.set_finished_reason(reason, beam)
+
+    def _initialize_dynamic_temperature_state(self) -> None:
+        dynamic_temperature_rules = self.py_dynamic_temperature_rules
+        if dynamic_temperature_rules:
+            self.py_dynamic_temperature_max_rule_len = max(
+                len(token_ids) for token_ids, _ in dynamic_temperature_rules)
+            self.py_dynamic_temperature_suffix_tokens = [
+                [] for _ in range(self.sampling_config.beam_width)
+            ]
+        else:
+            self.py_dynamic_temperature_max_rule_len = 0
+            self.py_dynamic_temperature_suffix_tokens = None
+
+    def _maybe_apply_dynamic_temperature(self, new_token: int,
+                                         beam_idx: int) -> None:
+        dynamic_temperature_rules = self.py_dynamic_temperature_rules
+        if not dynamic_temperature_rules:
+            return
+        if self.py_dynamic_temperature_suffix_tokens is None:
+            self._initialize_dynamic_temperature_state()
+        assert self.py_dynamic_temperature_suffix_tokens is not None
+        beam_suffix_tokens = self.py_dynamic_temperature_suffix_tokens[beam_idx]
+        beam_suffix_tokens.append(new_token)
+        max_rule_len = self.py_dynamic_temperature_max_rule_len
+        if len(beam_suffix_tokens) > max_rule_len:
+            del beam_suffix_tokens[:-max_rule_len]
+        for token_ids, temperature in dynamic_temperature_rules:
+            if len(token_ids) > len(beam_suffix_tokens):
+                continue
+            if beam_suffix_tokens[-len(token_ids):] == token_ids:
+                # Store the override on the Python side only; mutating the
+                # pybind'd SamplingConfig field races with the C++ batch
+                # manager reading mSamplingConfig.temperature (hang on ARM).
+                if self.py_dynamic_temperature_override != temperature:
+                    self.py_dynamic_temperature_override = temperature
+                    self.py_sampling_strategy = None
+                return
+
+    def add_new_token(self, new_token: int, beam_idx: int) -> None:
+        super().add_new_token(new_token, beam_idx)
+        self._maybe_apply_dynamic_temperature(new_token, beam_idx)
 
     def create_child_request(self, child_id):
         child = super().create_child_request(child_id)
@@ -1188,6 +1236,9 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
+    llm_request.py_dynamic_temperature_rules = getattr(
+        executor_request, "py_dynamic_temperature_rules", None)
+    llm_request._initialize_dynamic_temperature_state()
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
