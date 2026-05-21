@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -205,6 +205,41 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumLocalExperts = localNumExperts;
 
         moe::dev::routing::routingRenormalize::run(routingData, stream);
+    }
+    else if (routingMethodType == RoutingMethodType::MiniMax2)
+    {
+        moe::dev::routing::routingMiniMax::Data routingData;
+
+        routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+        routingData.mUsePdl = true;
+        routingData.mNormTopkProb = true;
+
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+
+        routingData.mPtrTopKPacked = routingExpertIndexes;
+        routingData.mPtrExpertCounts = expertCountHistogram;
+        routingData.mPtrPermutedIdxSize = permutedIdxSize;
+        routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+        routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+        routingData.mPtrTopKWeights = expertWeights;
+        routingData.mPtrTopKIds = expertIds;
+
+        routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+        routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+        routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+        routingData.mPtrRoutingBias = routingBias;
+        routingData.mNumTokens = numTokens;
+        routingData.mNumExperts = numExperts;
+        routingData.mTopK = topK;
+        routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
+        routingData.mLocalExpertsStartIdx = localExpertOffset;
+        routingData.mLocalExpertsStrideLog2 = 0;
+        routingData.mNumLocalExperts = localNumExperts;
+
+        moe::dev::routing::routingMiniMax::run(routingData, stream);
     }
     else
     {

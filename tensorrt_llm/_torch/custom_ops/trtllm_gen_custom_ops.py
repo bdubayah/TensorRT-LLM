@@ -62,10 +62,14 @@ def prepare_dummy_topk_and_hook(
     if not tuner.is_tuning_mode:
         return routing_logits, topk_weights, topk_ids, base_tuning_config
 
+    routing_logits_dtype = (torch.float32 if routing_method_type
+                            in (RoutingMethodType.DeepSeekV3,
+                                RoutingMethodType.MiniMax2) else torch.bfloat16)
+
     if routing_logits is None:
         routing_logits_for_tuner = torch.randn(hidden_states.shape[0],
                                                num_experts,
-                                               dtype=torch.bfloat16,
+                                               dtype=routing_logits_dtype,
                                                device=hidden_states.device)
     else:
         routing_logits_for_tuner = routing_logits
@@ -85,6 +89,14 @@ def prepare_dummy_topk_and_hook(
             routed_scaling_factor,
             'is_fused':
             False,  # fuse_routing_kernel
+            'callable_e_score_correction_bias':
+            lambda: torch.randn(
+                num_experts, dtype=torch.bfloat16, device=hidden_states.device)
+        })
+    elif routing_method_type == RoutingMethodType.MiniMax2:
+        routing_cls_kwargs.update({
+            'num_experts':
+            num_experts,
             'callable_e_score_correction_bias':
             lambda: torch.randn(
                 num_experts, dtype=torch.bfloat16, device=hidden_states.device)
@@ -117,7 +129,7 @@ def prepare_dummy_topk_and_hook(
             routing_logits_for_tuner = torch.randn(
                 current_num_tokens,
                 num_experts,
-                dtype=torch.bfloat16,
+                dtype=routing_logits_dtype,
                 device=inputs[hidden_states_index].device)
 
         # Only recreate if we originally created dummies

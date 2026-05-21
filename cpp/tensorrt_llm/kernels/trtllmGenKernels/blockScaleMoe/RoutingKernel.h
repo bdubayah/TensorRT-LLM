@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -328,6 +328,53 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
 void run(Data const& data, void* stream);
 
 } // namespace routingRenormalize
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace routingMiniMax
+{
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct Data : public DataBase
+{
+    tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
+
+    void const* mPtrRoutingBias{nullptr};
+
+    bool mNormTopkProb{true};
+};
+
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_, bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, MaxNumTopExperts_, isPow2_, UsePdl_>
+{
+    using InputT = InputT_;
+    using OutputT = OutputT_;
+
+    PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
+
+    OutputT const* mPtrRoutingBias = nullptr;
+
+    int32_t mTopK = 0;
+
+    bool mNormTopkProb = true;
+
+    static KernelParams setKernelParams(Data const& data)
+    {
+        KernelParams params;
+        params.setBaseParams(data);
+
+        params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*) data.mPtrTopKPacked;
+        params.mPtrRoutingBias = static_cast<OutputT const*>(data.mPtrRoutingBias);
+        params.mNormTopkProb = data.mNormTopkProb;
+        params.mTopK = data.mTopK;
+        return params;
+    }
+};
+
+void run(Data const& data, void* stream);
+
+} // namespace routingMiniMax
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 } // namespace routing

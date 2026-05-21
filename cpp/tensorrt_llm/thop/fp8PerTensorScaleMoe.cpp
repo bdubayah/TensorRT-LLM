@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -64,7 +64,8 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
         }
         else
         {
-            if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3)
+            if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3
+                || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::MiniMax2)
             {
                 TORCH_CHECK(
                     routing_logits.value().scalar_type() == at::ScalarType::Float, "routing_logits must be float");
@@ -124,6 +125,12 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
     {
         TORCH_CHECK(top_k == 1, "Current routing kernel (no groups, Llama4) only supports top_k=1.");
+    }
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::MiniMax2)
+    {
+        TORCH_CHECK(
+            top_k <= 8 && top_k > 0, "Current routing kernel (no groups, MiniMax2) only supports top_k<=8 && top_k>0.");
+        TORCH_CHECK(num_experts <= 256, "Current routing kernel (no groups, MiniMax2) only supports num_experts<=256.");
     }
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
         || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)

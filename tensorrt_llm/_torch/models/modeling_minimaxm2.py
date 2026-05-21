@@ -34,22 +34,23 @@ from ..utils import AuxStreamType
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
 
 
-# MiniMax M2/M2.1 requires the implementation of the following two additional components:
-#  1. MoE routing method: Currently, TRT-LLM does not support
-#     the following routing method: sigmoid -> add bias -> topk -> renorm.
-#  2. QK layer normalization needs to be performed across the head_num * head_size dimension,
-#     which conflicts with the current TP-mode attention logic.
-# For the better performance, we suggest to enable attention DP when using MiniMax M2/M2.1 model.
+# MiniMax M2/M2.1 requires two non-standard components:
+#  1. MoE routing uses sigmoid -> add bias -> topk -> renorm, which needs a
+#     dedicated kernel path on the TRT-LLM backend.
+#  2. QK layer normalization needs to be performed across the head_num * head_size
+#     dimension, which conflicts with the current TP-mode attention logic.
+# For better performance, we suggest enabling attention DP when using MiniMax
+# M2/M2.1.
 class _EScoreCorrectionBiasHolder(nn.Module):
     """Holds e_score_correction_bias so the generic weight loader visits it with a narrow
     prefix (block_sparse_moe.e_score_correction_bias). This avoids mark_consumed deleting
     the whole block_sparse_moe prefix before gate and experts.backend load (see #11119).
     """
 
-    def __init__(self, num_experts: int):
+    def __init__(self, num_experts: int, dtype: torch.dtype):
         super().__init__()
         self.e_score_correction_bias = nn.Parameter(
-            torch.empty((num_experts), dtype=torch.float32), requires_grad=False
+            torch.empty((num_experts), dtype=dtype), requires_grad=False
         )
 
     def load_weights(self, weights: List[Dict]):
@@ -74,11 +75,13 @@ class MiniMaxM2MoE(nn.Module):
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
+        self.moe_backend = model_config.moe_backend
 
         # moe gate (linear layer) only runs in half/full precision for now
         self.gate = Linear(
             self.hidden_dim, self.num_experts, bias=False, dtype=torch.float32, quant_config=None
         )
+        bias_dtype = torch.bfloat16 if self.moe_backend == "TRTLLM" else torch.float32
 
         reduce_results = True
         self.experts = create_moe(
@@ -95,7 +98,7 @@ class MiniMaxM2MoE(nn.Module):
         )
         # Holder ensures generic loader only marks block_sparse_moe.e_score_correction_bias
         # consumed, so gate and experts.backend can still load (see #11119).
-        self.e_score_correction_bias = _EScoreCorrectionBiasHolder(self.num_experts)
+        self.e_score_correction_bias = _EScoreCorrectionBiasHolder(self.num_experts, bias_dtype)
 
     def forward(
         self,

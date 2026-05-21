@@ -68,7 +68,8 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     }
     else if (routing_logits.has_value())
     {
-        if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3)
+        if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3
+            || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::MiniMax2)
         {
             TORCH_CHECK(routing_logits.value().scalar_type() == at::ScalarType::Float, "routing_logits must be float");
         }
@@ -132,6 +133,12 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
     else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4)
     {
         TORCH_CHECK(top_k == 1, "Current routing kernel (no groups, Llama4) only supports top_k=1.");
+    }
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::MiniMax2)
+    {
+        TORCH_CHECK(
+            top_k <= 8 && top_k > 0, "Current routing kernel (no groups, MiniMax2) only supports top_k<=8 && top_k>0.");
+        TORCH_CHECK(num_experts <= 256, "Current routing kernel (no groups, MiniMax2) only supports num_experts<=256.");
     }
 
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");

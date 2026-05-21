@@ -72,7 +72,8 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     }
     else if (routing_logits.has_value())
     {
-        if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3)
+        if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3
+            || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::MiniMax2)
         {
             TORCH_CHECK(routing_logits.value().scalar_type() == at::ScalarType::Float, "routing_logits must be float");
         }
@@ -133,6 +134,12 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     {
         TORCH_CHECK(top_k <= 32 && top_k > 0,
             "Current routing kernel (no groups, renormalize) only supports top_k<=32 && top_k>0.");
+    }
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::MiniMax2)
+    {
+        TORCH_CHECK(
+            top_k <= 8 && top_k > 0, "Current routing kernel (no groups, MiniMax2) only supports top_k<=8 && top_k>0.");
+        TORCH_CHECK(num_experts <= 256, "Current routing kernel (no groups, MiniMax2) only supports num_experts<=256.");
     }
 
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");

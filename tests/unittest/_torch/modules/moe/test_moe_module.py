@@ -1118,12 +1118,12 @@ def test_configurable_moe_single_gpu(
         dtype,
     )
 
-    # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
+    # DeepSeekV3 and MiniMax routing require float32 routing_logits for TRTLLM backend
     # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
-    if (
-        moe_backend == MoeBackendType.TRTLLM.value
-        and routing_method_cls == DeepSeekV3MoeRoutingMethod
+    if moe_backend == MoeBackendType.TRTLLM.value and routing_method_cls in (
+        DeepSeekV3MoeRoutingMethod,
+        MiniMaxM2MoeRoutingMethod,
     ):
         dtype_routing_logits = torch.float32
 
@@ -1199,12 +1199,12 @@ def test_configurable_moe_multi_gpu(
         dtype,
     )
 
-    # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
+    # DeepSeekV3 and MiniMax routing require float32 routing_logits for TRTLLM backend
     # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
-    if (
-        moe_backend == MoeBackendType.TRTLLM.value
-        and routing_method_cls == DeepSeekV3MoeRoutingMethod
+    if moe_backend == MoeBackendType.TRTLLM.value and routing_method_cls in (
+        DeepSeekV3MoeRoutingMethod,
+        MiniMaxM2MoeRoutingMethod,
     ):
         dtype_routing_logits = torch.float32
 
