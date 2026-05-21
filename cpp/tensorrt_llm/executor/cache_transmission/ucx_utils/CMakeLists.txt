@@ -13,6 +13,7 @@ if(ENABLE_UCX)
   # Add the NIXL wrapper target
 
   add_library(${UCX_WRAPPER_TARGET} SHARED connection.cpp
+                                           payloadStaging.cpp
                                            ucxCacheCommunicator.cpp)
   set_target_properties(
     ${UCX_WRAPPER_TARGET}

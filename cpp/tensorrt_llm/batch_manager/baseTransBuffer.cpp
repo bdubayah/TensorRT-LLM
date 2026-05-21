@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,10 +21,99 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
 
+#include <exception>
 #include <mutex>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager
 {
+BaseTransBufferManager::BufferLease::BufferLease(
+    BaseTransBufferManager* manager, std::optional<int> bufferId, Direction direction)
+    : mManager{manager}
+    , mBufferId{bufferId}
+    , mDirection{direction}
+{
+}
+
+BaseTransBufferManager::BufferLease::~BufferLease() noexcept
+{
+    resetNoThrow();
+}
+
+BaseTransBufferManager::BufferLease::BufferLease(BufferLease&& other) noexcept
+    : mManager{std::exchange(other.mManager, nullptr)}
+    , mBufferId{std::exchange(other.mBufferId, std::nullopt)}
+    , mDirection{other.mDirection}
+{
+}
+
+BaseTransBufferManager::BufferLease& BaseTransBufferManager::BufferLease::operator=(BufferLease&& other) noexcept
+{
+    if (this != &other)
+    {
+        resetNoThrow();
+        mManager = std::exchange(other.mManager, nullptr);
+        mBufferId = std::exchange(other.mBufferId, std::nullopt);
+        mDirection = other.mDirection;
+    }
+    return *this;
+}
+
+void BaseTransBufferManager::BufferLease::reset()
+{
+    if (mManager != nullptr)
+    {
+        if (mDirection == Direction::kSend)
+        {
+            mManager->freeBufferIndexForSend(mBufferId);
+        }
+        else
+        {
+            mManager->freeBufferIndexForRecv(mBufferId);
+        }
+        mManager = nullptr;
+        mBufferId = std::nullopt;
+    }
+}
+
+void BaseTransBufferManager::BufferLease::resetNoThrow() noexcept
+{
+    try
+    {
+        reset();
+    }
+    catch (std::exception const& e)
+    {
+        logReleaseFailure(&e);
+    }
+    catch (...)
+    {
+        logReleaseFailure(nullptr);
+    }
+}
+
+void BaseTransBufferManager::BufferLease::logReleaseFailure(std::exception const* exception) const noexcept
+{
+    char const* direction = mDirection == Direction::kSend ? "send" : "receive";
+    if (exception != nullptr)
+    {
+        TLLM_LOG_ERROR("Failed to release %s cache transfer buffer: %s", direction, exception->what());
+    }
+    else
+    {
+        TLLM_LOG_ERROR("Failed to release %s cache transfer buffer.", direction);
+    }
+}
+
+BaseTransBufferManager::BufferLease BaseTransBufferManager::assignBufferIndexForSendLease()
+{
+    return BufferLease{this, assignBufferIndexForSend(), BufferLease::Direction::kSend};
+}
+
+BaseTransBufferManager::BufferLease BaseTransBufferManager::assignBufferIndexForRecvLease()
+{
+    return BufferLease{this, assignBufferIndexForRecv(), BufferLease::Direction::kRecv};
+}
 
 BaseTransBufferManager::BaseTransBufferManager(
     size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens)

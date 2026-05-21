@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -481,7 +481,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // cache blocks to the corresponding buffer.
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
-        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+        auto sendBufferLease = mCacheTransBufferManager->assignBufferIndexForSendLease();
+        auto cacheBufferId = sendBufferLease.get();
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         auto ppRank = selfIdx
@@ -565,7 +566,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
         session.setTime(TransferSession::kTimeTransmissions);
 
-        mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
+        sendBufferLease.reset();
         session.setTime(TransferSession::kTimePostprocess);
     }
     TLLM_LOG_DEBUG(
@@ -787,6 +788,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             size_t remainNoCoverTargetNum = 0;
             size_t bufferCoverTargetNum = 0;
             std::optional<int> cacheBufferId = std::nullopt;
+            std::optional<BaseTransBufferManager::BufferLease> recvBufferLease;
             {
                 NVTX3_SCOPED_RANGE(formatInputAllocBuffer);
 
@@ -800,7 +802,8 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 }
                 else
                 {
-                    cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+                    recvBufferLease.emplace(mCacheTransBufferManager->assignBufferIndexForRecvLease());
+                    cacheBufferId = recvBufferLease->get();
                 }
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
@@ -935,7 +938,11 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     recvSplitCaches, outputBuffersPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
 
                 bufferManager.getStream().synchronize();
-                if (cacheBufferId.has_value())
+                if (recvBufferLease.has_value())
+                {
+                    recvBufferLease->reset();
+                }
+                else if (cacheBufferId.has_value())
                 {
                     mCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
                 }

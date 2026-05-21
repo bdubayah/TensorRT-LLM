@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,12 +17,13 @@
 
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/ucxCacheCommunicator.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
+#include "tensorrt_llm/executor/cache_transmission/ucx_utils/payloadStaging.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <chrono>
-#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -321,8 +322,11 @@ UcxConnectionManager::UcxConnectionManager()
         }
 
         TLLM_CUDA_CHECK(cudaGetDevice(&mDevice));
-        mUcxCtx = ucxx::createContext({{"RNDV_PIPELINE_ERROR_HANDLING", "y"}}, UCP_FEATURE_TAG);
-        int device = mDevice;
+        preallocatePayloadStagingBufferPool(mRank);
+        ucxx::ConfigMap ucxConfig{{"RNDV_PIPELINE_ERROR_HANDLING", "y"}};
+
+        mUcxCtx = ucxx::createContext(ucxConfig, UCP_FEATURE_TAG);
+        int const device = mDevice;
         try
         {
             mWorkersPool.push_back(mUcxCtx->createWorker());
@@ -560,13 +564,21 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
     static std::mutex sAddConnectionIPMutex;
     try
     {
-        std::shared_ptr<UcxConnection> connection;
         UcxConnection::ConnectionIdType connectionId = 0;
+        std::string const address = ip + ":" + std::to_string(port);
         {
             std::scoped_lock addConnectionIPLock(sAddConnectionIPMutex);
             // This lock ensures that only one thread can create an endpoint from hostname and establish a UCX
-            // connection at a time, guaranteeing that the only one listener will send connectionId to requester in the
-            // same time.
+            // connection at a time, and the re-check below keeps duplicate callers for the same peer from opening
+            // redundant UCX endpoints after another caller finished the bootstrap.
+            {
+                std::scoped_lock addressLock(mAddressToConnectionIdMutex);
+                auto const existingConnectionIt = mAddressToConnectionId.find(address);
+                if (existingConnectionIt != mAddressToConnectionId.end())
+                {
+                    return existingConnectionIt->second;
+                }
+            }
             auto reqSocket = zmq::socket_t(mZmqContext, zmq::socket_type::req);
             reqSocket.set(zmq::sockopt::ipv6, 1);
             reqSocket.connect(build_zmq_endpoint(ip, port));
@@ -587,13 +599,12 @@ UcxConnection::ConnectionIdType UcxConnectionManager::addConnection(std::string 
             auto serverWorkerAddressPtr = ucxx::createAddressFromString(serverWorkerAddress);
             auto newEp = mWorkersPool.front()->createEndpointFromWorkerAddress(serverWorkerAddressPtr, true);
             connectionId = getNewConnectionId(newEp);
-            connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true);
+            auto connection = std::make_shared<UcxConnection>(connectionId, newEp, this, true);
+            TLLM_CHECK(connectionId != 0);
+            std::scoped_lock lock(mConnectionsMutex, mAddressToConnectionIdMutex);
+            mConnections.emplace(connectionId, connection);
+            mAddressToConnectionId[address] = connectionId;
         }
-        TLLM_CHECK(connectionId != 0);
-        std::scoped_lock lock(mConnectionsMutex, mAddressToConnectionIdMutex);
-        mConnections.emplace(connectionId, connection);
-        std::string address = ip + ":" + std::to_string(port);
-        mAddressToConnectionId[address] = connectionId;
         return connectionId;
     }
     catch (std::exception const& e)
@@ -612,15 +623,30 @@ UcxConnection::ConnectionIdType UcxConnectionManager::getNewConnectionId(std::sh
 Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void* data, size_t size)
 {
     std::vector<char> buffer(size + sizeof(UcxConnection::ConnectionIdType));
-    std::promise<void> promise;
-    std::future<void> future = promise.get_future();
-    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
+    auto promise = std::make_shared<std::promise<void>>();
+    std::future<void> future = promise->get_future();
+    auto completionCallback = [promise](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise->set_value(); };
 
     std::shared_ptr<ucxx::Request> req = mWorkersPool.front()->tagRecv(
         buffer.data(), buffer.size(), ucxx::Tag(ctx.getTag()), ucxx::TagMask(0xFFFFFFFF), false, completionCallback);
-    if (!req->isCompleted())
+    while (!req->isCompleted())
     {
-        future.get();
+        if (ctx.getTransferTerminate().load())
+        {
+            // Explicitly cancel the posted receive before returning so UCX
+            // does not keep a stale match alive for a later handshake.
+            req->cancel();
+            while (!req->isCompleted())
+            {
+                future.wait_for(std::chrono::milliseconds(1));
+            }
+            if (req->getStatus() != UCS_OK)
+            {
+                return nullptr;
+            }
+            break;
+        }
+        future.wait_for(std::chrono::milliseconds(1));
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv SendConnectionId should be completed");
     req->checkError();

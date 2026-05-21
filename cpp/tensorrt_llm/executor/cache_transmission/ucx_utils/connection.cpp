@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,16 +19,87 @@
 #if ENABLE_UCX
 
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
-#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/executor/cache_transmission/ucx_utils/connection.h"
+#include "tensorrt_llm/executor/cache_transmission/ucx_utils/payloadStaging.h"
+#include <cstdint>
+#include <cstring>
+#include <exception>
+#include <future>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace tensorrt_llm::executor::kv_cache
 {
 
-// Using declarations to shorten the code
-using RequestSpecificException = tensorrt_llm::common::RequestSpecificException;
-using RequestErrorCode = tensorrt_llm::common::RequestErrorCode;
+namespace
+{
+constexpr int kDefaultHostControlRequestTimeoutMs = 0;
+constexpr char const* kUcxHostControlTimeoutMsEnv = "TRTLLM_UCX_HOST_CONTROL_TIMEOUT_MS";
+constexpr int32_t kTagTypeBits = 8;
+constexpr int32_t kTagTypeMask = (1 << kTagTypeBits) - 1;
+
+bool isHostControlTag(int tag)
+{
+    using tensorrt_llm::batch_manager::TransceiverTag;
+    // Request data tags encode their type in the low bits. Keep ready-signal tags on the host-control path even if a
+    // future caller passes an encoded tag instead of the bare kREADY_SIGNAL_TAG value.
+    return tag == TransceiverTag::kINFO_SIZE_TAG || tag == TransceiverTag::kINFO_TAG
+        || tag == TransceiverTag::kREADY_SIGNAL_TAG || (tag & kTagTypeMask) == TransceiverTag::kREADY_SIGNAL_TAG;
+}
+
+int getHostControlRequestTimeoutMs(int rank)
+{
+    return getUcxRequestTimeoutMs(
+        rank, kUcxHostControlTimeoutMsEnv, kDefaultHostControlRequestTimeoutMs, "host control");
+}
+
+void sendPayloadWithoutStaging(ucxx::Endpoint& endpoint, uint64_t sendTag, void const* data, size_t size)
+{
+    std::promise<void> promise;
+    std::future<void> future = promise.get_future();
+    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
+    auto req = endpoint.tagSend(const_cast<void*>(data), size, ucxx::Tag(sendTag), false, completionCallback);
+    if (!req->isCompleted())
+    {
+        future.get();
+    }
+    TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
+    req->checkError();
+}
+
+void recvPayloadWithoutStaging(ucxx::Endpoint& endpoint, uint64_t recvTag, void* data, size_t size)
+{
+    std::promise<void> promise;
+    std::future<void> future = promise.get_future();
+    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
+    auto req = endpoint.tagRecv(data, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback);
+    if (!req->isCompleted())
+    {
+        future.get();
+    }
+    TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
+    req->checkError();
+}
+
+void logSendEnd(UcxConnection::ConnectionIdType connectionId, UcxConnection::ConnectionIdType connectionIdInPeer,
+    bool fromRequester, int rank)
+{
+    TLLM_LOG_DEBUG(rank, "end UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
+        connectionId, connectionIdInPeer, fromRequester);
+}
+
+void logRecvEnd(UcxConnection::ConnectionIdType connectionId, UcxConnection::ConnectionIdType connectionIdInPeer,
+    bool fromRequester, int rank)
+{
+    TLLM_LOG_DEBUG(rank, "end UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
+        connectionId, connectionIdInPeer, fromRequester);
+}
+
+} // namespace
 
 UcxConnection::UcxConnection(ConnectionIdType connectionId, std::shared_ptr<ucxx::Endpoint> endpoint,
     UcxConnectionManager* manager, bool fromRequester)
@@ -109,20 +180,20 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
         "start UcxConnection::sendConnectionId , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d",
         mConnectionId, mConnectionIdInPeer, mFromRequester);
 
-    std::promise<void> promise;
-
-    std::future<void> future = promise.get_future();
-    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
+    auto promise = std::make_shared<std::promise<void>>();
+    std::future<void> future = promise->get_future();
+    auto completionCallback = [promise](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise->set_value(); };
 
     uint64_t tag = ((mSendTagPrefix & 0xFFFFFFFF) << 32)
         | static_cast<uint64_t>(tensorrt_llm::batch_manager::TransceiverTag::kID_TAG);
-    std::vector<char> buffer(size + sizeof(mConnectionId));
-    memcpy(buffer.data(), data, size);
-    memcpy(buffer.data() + size, &mConnectionIdInPeer, sizeof(mConnectionIdInPeer));
-    auto req = mEndpoint->tagSend(buffer.data(), buffer.size(), ucxx::Tag(tag), false, completionCallback);
+    auto buffer = std::make_shared<std::vector<char>>(size + sizeof(mConnectionId));
+    memcpy(buffer->data(), data, size);
+    memcpy(buffer->data() + size, &mConnectionIdInPeer, sizeof(mConnectionIdInPeer));
+    auto req = mEndpoint->tagSend(buffer->data(), buffer->size(), ucxx::Tag(tag), false, completionCallback, buffer);
     if (!req->isCompleted())
     {
-        future.get();
+        waitForUcxRequestCompletion(req, future, ctx, mManager->getRank(), "sendConnectionId", true, buffer,
+            buffer->size(), getHostControlRequestTimeoutMs(mManager->getRank()));
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "sendConnectionId should be completed");
     req->checkError();
@@ -143,23 +214,40 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) 
         mConnectionIdInPeer, mFromRequester);
 
     TLLM_CHECK_WITH_INFO((mEndpoint), "sendBuffer called without established communicator channel.");
-    std::promise<void> promise;
-    std::future<void> future = promise.get_future();
-    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
     uint64_t sendTag = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
+    int const rank = mManager->getRank();
+    bool const hostControlTag = isHostControlTag(ctx.getTag());
+    if (!hostControlTag)
+    {
+        if (isPayloadStagingEnabled(rank))
+        {
+            sendPayloadWithStaging(*mEndpoint, sendTag, ctx, data, size, rank);
+        }
+        else
+        {
+            sendPayloadWithoutStaging(*mEndpoint, sendTag, data, size);
+        }
+        logSendEnd(mConnectionId, mConnectionIdInPeer, mFromRequester, rank);
+        return;
+    }
 
-    auto req = mEndpoint->tagSend(const_cast<void*>(data), size, ucxx::Tag(sendTag), false, completionCallback);
+    auto promise = std::make_shared<std::promise<void>>();
+    std::future<void> future = promise->get_future();
+    auto completionCallback = [promise](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise->set_value(); };
+    auto hostControlBuffer = std::make_shared<std::vector<char>>(size);
+    memcpy(hostControlBuffer->data(), data, size);
+    ucxx::RequestCallbackUserData callbackData = hostControlBuffer;
+    auto req = mEndpoint->tagSend(
+        hostControlBuffer->data(), size, ucxx::Tag(sendTag), false, completionCallback, callbackData);
     if (!req->isCompleted())
     {
-        future.get();
+        waitForUcxRequestCompletion(req, future, ctx, rank, "send", true, callbackData, hostControlBuffer->size(),
+            getHostControlRequestTimeoutMs(rank));
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
-    // throw if there is error
     req->checkError();
 
-    TLLM_LOG_DEBUG(mManager->getRank(),
-        "end UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
-        mConnectionIdInPeer, mFromRequester);
+    logSendEnd(mConnectionId, mConnectionIdInPeer, mFromRequester, rank);
 }
 
 void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
@@ -169,22 +257,40 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
         "start UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
         mConnectionIdInPeer, mFromRequester);
     TLLM_CHECK_WITH_INFO((mEndpoint), "recvBuffer called without established communicator channel.");
-    std::promise<void> promise;
-    std::future<void> future = promise.get_future();
-    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
     uint64_t recvTag = ((mRecvTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
-    auto req = mEndpoint->tagRecv(data, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback);
+    int const rank = mManager->getRank();
+    bool const hostControlTag = isHostControlTag(ctx.getTag());
+    if (!hostControlTag)
+    {
+        if (isPayloadStagingEnabled(rank))
+        {
+            recvPayloadWithStaging(*mEndpoint, recvTag, ctx, data, size, rank);
+        }
+        else
+        {
+            recvPayloadWithoutStaging(*mEndpoint, recvTag, data, size);
+        }
+        logRecvEnd(mConnectionId, mConnectionIdInPeer, mFromRequester, rank);
+        return;
+    }
+
+    auto promise = std::make_shared<std::promise<void>>();
+    std::future<void> future = promise->get_future();
+    auto completionCallback = [promise](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise->set_value(); };
+    auto hostControlBuffer = std::make_shared<std::vector<char>>(size);
+    ucxx::RequestCallbackUserData callbackData = hostControlBuffer;
+    auto req = mEndpoint->tagRecv(
+        hostControlBuffer->data(), size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback, callbackData);
     if (!req->isCompleted())
     {
-        future.get();
+        waitForUcxRequestCompletion(req, future, ctx, rank, "recv", true, callbackData, hostControlBuffer->size(),
+            getHostControlRequestTimeoutMs(rank));
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
-    // throw if there is error
     req->checkError();
+    memcpy(data, hostControlBuffer->data(), size);
 
-    TLLM_LOG_DEBUG(mManager->getRank(),
-        "end UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
-        mConnectionIdInPeer, mFromRequester);
+    logRecvEnd(mConnectionId, mConnectionIdInPeer, mFromRequester, rank);
 }
 
 } // namespace tensorrt_llm::executor::kv_cache

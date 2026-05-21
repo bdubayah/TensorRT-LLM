@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -52,6 +53,44 @@ enum class BufferKind : uint8_t
 class BaseTransBufferManager
 {
 public:
+    class BufferLease
+    {
+    public:
+        BufferLease() = default;
+        ~BufferLease() noexcept;
+
+        BufferLease(BufferLease const&) = delete;
+        BufferLease& operator=(BufferLease const&) = delete;
+
+        BufferLease(BufferLease&& other) noexcept;
+        BufferLease& operator=(BufferLease&& other) noexcept;
+
+        [[nodiscard]] std::optional<int> get() const noexcept
+        {
+            return mBufferId;
+        }
+
+        void reset();
+
+    private:
+        friend class BaseTransBufferManager;
+
+        enum class Direction : uint8_t
+        {
+            kSend,
+            kRecv
+        };
+
+        BufferLease(BaseTransBufferManager* manager, std::optional<int> bufferId, Direction direction);
+
+        void resetNoThrow() noexcept;
+        void logReleaseFailure(std::exception const* exception) const noexcept;
+
+        BaseTransBufferManager* mManager{nullptr};
+        std::optional<int> mBufferId{std::nullopt};
+        Direction mDirection{Direction::kSend};
+    };
+
     virtual ~BaseTransBufferManager() = default;
 
     [[nodiscard]] virtual BufferKind getBufferKind() const = 0;
@@ -60,6 +99,9 @@ public:
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.
     std::optional<int> assignBufferIndexForSend();
 
+    /// @brief Assign a send buffer index and return it to the pool on scope exit.
+    [[nodiscard]] BufferLease assignBufferIndexForSendLease();
+
     /// @brief Free a buffer index used for sending.
     /// @param bufferId The buffer index to free.
     void freeBufferIndexForSend(std::optional<int> bufferId);
@@ -67,6 +109,9 @@ public:
     /// @brief Assign a buffer index for receiving.
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.
     std::optional<int> assignBufferIndexForRecv();
+
+    /// @brief Assign a receive buffer index and return it to the pool on scope exit.
+    [[nodiscard]] BufferLease assignBufferIndexForRecvLease();
 
     /// @brief Free a buffer index used for receiving.
     /// @param bufferId The buffer index to free.

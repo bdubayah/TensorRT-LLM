@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,6 +35,10 @@ std::optional<size_t> getUInt64Env(char const* name);
 std::optional<float> getFloatEnv(char const* name);
 
 bool getBoolEnv(char const* name);
+
+size_t parseMemorySize(std::string const& input);
+
+std::optional<size_t> getMemorySizeEnv(char const* name);
 
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();

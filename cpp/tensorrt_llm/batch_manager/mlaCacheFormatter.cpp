@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -253,7 +253,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
+        auto sendBufferLease = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSendLease();
+        auto cacheBufferId = sendBufferLease.get();
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -380,7 +381,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         {
             sendBufferFun(deviceId, pickUpConnections[0]);
         }
-        mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForSend(cacheBufferId);
+        sendBufferLease.reset();
     }
     session.setTime(TransferSession::kTimeTransmissions);
     session.setTime(TransferSession::kTimePostprocess);
@@ -459,6 +460,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         int deviceId = bufferManager.getStream().getDevice();
 
         std::optional<int> cacheBufferId = std::nullopt;
+        std::optional<BaseTransBufferManager::BufferLease> recvBufferLease;
 
         if (common::getEnvTryZCopyForKVCacheTransfer()
             && destConfig.getParallelConfig().mPipelineParallelism
@@ -493,7 +495,9 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             }
             else
             {
-                cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecv();
+                recvBufferLease.emplace(
+                    mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecvLease());
+                cacheBufferId = recvBufferLease->get();
             }
 
             auto targetNum = pickUpConnections.size();
@@ -642,7 +646,11 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             bufferManager.getStream().synchronize();
         }
 
-        if (cacheBufferId.has_value())
+        if (recvBufferLease.has_value())
+        {
+            recvBufferLease->reset();
+        }
+        else if (cacheBufferId.has_value())
         {
             mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForRecv(cacheBufferId);
         }

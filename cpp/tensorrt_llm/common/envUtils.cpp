@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,8 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
@@ -89,7 +91,7 @@ static std::string trim(std::string const& str)
 }
 
 // Parse memory size
-static size_t parseMemorySize(std::string const& input)
+size_t parseMemorySize(std::string const& input)
 {
     std::string str = trim(input);
 
@@ -115,23 +117,23 @@ static size_t parseMemorySize(std::string const& input)
 
     toLower(unitPart);
     size_t multiplier = 1;
-    if (unitPart == "b")
+    if (unitPart.empty() || unitPart == "b")
     {
         multiplier = 1;
     }
-    else if (unitPart == "kb")
+    else if (unitPart == "kb" || unitPart == "kib")
     {
         multiplier = 1024;
     }
-    else if (unitPart == "mb")
+    else if (unitPart == "mb" || unitPart == "mib")
     {
         multiplier = 1024 * 1024;
     }
-    else if (unitPart == "gb")
+    else if (unitPart == "gb" || unitPart == "gib")
     {
         multiplier = 1024 * 1024 * 1024;
     }
-    else if (unitPart == "tb")
+    else if (unitPart == "tb" || unitPart == "tib")
     {
         multiplier = static_cast<size_t>(pow(1024.0, 4));
     }
@@ -141,6 +143,16 @@ static size_t parseMemorySize(std::string const& input)
     }
 
     return static_cast<size_t>(value * multiplier);
+}
+
+std::optional<size_t> getMemorySizeEnv(char const* name)
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr)
+    {
+        return std::nullopt;
+    }
+    return parseMemorySize(env);
 }
 
 // XQA kernels (optimized kernels for generation phase).
