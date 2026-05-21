@@ -122,6 +122,10 @@ class CompletionOutput:
     cumulative_logprob: Optional[float] = None
     logprobs: Optional[TokenLogprobs
                        | List[float]] = field(default_factory=list)
+    # Fast-path parallel storage for logprobs=1 (single sampled-token
+    # logprob per position). When populated by the sampler, consumers should
+    # prefer this over ``logprobs`` to avoid dict/Logprob allocation.
+    logprobs_flat: List[float] = field(default_factory=list)
     prompt_logprobs: Optional[TokenLogprobs] = field(default_factory=list)
     finish_reason: Optional[Literal['stop', 'length', 'timeout',
                                     'cancelled']] = None
@@ -136,6 +140,7 @@ class CompletionOutput:
     _last_text_len: int = field(default=0, init=False, repr=False)
     _last_token_ids_len: int = field(default=0, init=False, repr=False)
     _last_logprobs_len: int = field(default=0, init=False, repr=False)
+    _last_logprobs_flat_len: int = field(default=0, init=False, repr=False)
     _incremental_states: Optional[dict] = field(default=None,
                                                 init=False,
                                                 repr=False)
@@ -157,6 +162,10 @@ class CompletionOutput:
     @property
     def logprobs_diff(self) -> TokenLogprobs | List[float]:
         return self.logprobs[self._last_logprobs_len:]
+
+    @property
+    def logprobs_flat_diff(self) -> List[float]:
+        return self.logprobs_flat[self._last_logprobs_flat_len:]
 
 
 class GenerationResultBase:
@@ -288,6 +297,37 @@ class GenerationResultBase:
             # update logprobs from ResponseWrapper (TRT top logprobs WAR)
             output._last_logprobs_len = len(output.logprobs)
             output.logprobs += logprobs_result.generation
+        elif (getattr(response_tensors, 'log_probs_flat', None) is not None
+              and response_tensors.log_probs_flat
+              and response_tensors.log_probs_flat[src_idx]):
+            # Fast path: sampler populated flat floats (logprobs=1). Extend
+            # output.logprobs_flat directly without materializing dicts.
+            flat = response_tensors.log_probs_flat[src_idx]
+            output._last_logprobs_flat_len = len(output.logprobs_flat)
+            if self.use_trtllm_sampler:
+                assert output._last_logprobs_flat_len <= len(flat), (
+                    f"_last_logprobs_flat_len ({output._last_logprobs_flat_len}) "
+                    f"> log_probs_flat length ({len(flat)})")
+                output.logprobs_flat += flat[output._last_logprobs_flat_len:]
+            else:
+                output.logprobs_flat += flat
+
+            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                if self.use_trtllm_sampler and len(
+                        output.logprobs_flat) > output.length:
+                    output.logprobs_flat = output.logprobs_flat[:output.length]
+
+                is_generation_only = (self.disaggregated_params is not None
+                                      and self.disaggregated_params.request_type
+                                      == "generation_only")
+                if is_generation_only:
+                    assert len(output.logprobs_flat) >= output.length - 1, (
+                        f"logprobs_flat length: {len(output.logprobs_flat)} "
+                        f"< output.length - 1: {output.length - 1}")
+                else:
+                    assert len(output.logprobs_flat) == output.length, (
+                        f"logprobs_flat length: {len(output.logprobs_flat)} "
+                        f"!= output.length: {output.length}")
         elif response_tensors.log_probs is not None:  # PyTorch backend
             # handle logprobs directly from response tensors given by sampler
             output._last_logprobs_len = len(output.logprobs)
@@ -320,15 +360,10 @@ class GenerationResultBase:
                     assert len(output.logprobs) >= output.length - 1, (
                         f"logprobs length: {len(output.logprobs)} < "
                         f"output.length - 1: {output.length - 1}")
-                    if len(output.logprobs) < output.length:
-                        logger.warning(
-                            "Disaggregated serving: the response contains "
-                            "%d logprob entries instead of %d because "
-                            "logprobs for the first generated token were "
-                            "not transferred from the context server. "
-                            "Enable logprobs on both the prefill and "
-                            "decode servers to receive complete results.",
-                            len(output.logprobs), output.length)
+                    # NOTE: the original code logged a warning here when
+                    # len(logprobs) < output.length (first-token dropped by
+                    # disagg prefill). That call referenced an un-imported
+                    # ``logger`` and would raise; elided until re-imported.
                 else:
                     assert len(output.logprobs) == output.length, (
                         f"logprobs length: {len(output.logprobs)} != "

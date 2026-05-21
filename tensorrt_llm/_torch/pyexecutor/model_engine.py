@@ -1380,6 +1380,14 @@ class PyTorchModelEngine(ModelEngine):
             max_seq_len=self.max_seq_len)
         return self.spec_metadata
 
+    @staticmethod
+    def _prepare_spec_logprob_metadata(
+        scheduled_requests: ScheduledRequests,
+        spec_metadata: SpecMetadata,
+    ) -> None:
+        spec_metadata.populate_sampling_params_for_one_model(
+            scheduled_requests.all_requests())
+
     def __del__(self) -> None:
         self.model = None
         self.model_loader = None
@@ -1791,6 +1799,8 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata.request_accepted_path = request_accepted_path
 
             spec_metadata.num_tokens = total_num_tokens
+            self._prepare_spec_logprob_metadata(scheduled_requests,
+                                                spec_metadata)
             spec_metadata.prepare()
 
             # Handle distributed spec metadata
@@ -2996,9 +3006,8 @@ class PyTorchModelEngine(ModelEngine):
                 num_accepted_draft_tokens)]
             if isinstance(spec_metadata, Eagle3SpecMetadata):
                 spec_metadata.request_accepted_path = request_accepted_path
-            # No-op for non 1-model
-            spec_metadata.populate_sampling_params_for_one_model(
-                scheduled_requests.all_requests())
+            self._prepare_spec_logprob_metadata(scheduled_requests,
+                                                spec_metadata)
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
@@ -3164,6 +3173,8 @@ class PyTorchModelEngine(ModelEngine):
                 scheduled_requests.generation_requests)
             spec_metadata.num_tokens = num_tokens
             spec_metadata.seq_lens = sequence_lengths
+            self._prepare_spec_logprob_metadata(scheduled_requests,
+                                                spec_metadata)
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 

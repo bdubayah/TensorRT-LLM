@@ -1,3 +1,4 @@
+import os
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -8,8 +9,14 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
-from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.executor.result import Logprob, TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
+
+# Fast path for logprobs=1 spec-dec: store raw floats, materialize dicts lazily.
+# Skips per-token Logprob dataclass + dict allocation in the sampler hot loop.
+# Default-on; set TRTLLM_FLAT_LOGPROBS=0 to opt out (e.g. for PP rank sync,
+# which doesn't route flat entries through ``diff.log_probs_list`` yet).
+FLAT_LOGPROBS_MODE = os.environ.get("TRTLLM_FLAT_LOGPROBS", "1") != "0"
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 '''
@@ -212,14 +219,110 @@ class LogitsStorage:
 
 
 class LogProbStorage:
+    """Stores per-token logprobs.
+
+    Two internal storage modes:
+
+    - ``log_probs`` (dict form, ``list[list[dict[int, Logprob]]]``): the
+      original encoding, used by top-k logprobs and as the wire format read by
+      ``PyResult.log_probs``.
+    - Flat form (``_flat_token_ids``, ``_flat_logprobs``): used by the
+      ``FLAT_LOGPROBS_MODE`` fast path. Writes are cheap (float append); the
+      dict form is lazily materialized on read via ``_ensure_materialized``.
+
+    ``log_probs`` is a property so reads always route through lazy
+    materialization. Direct writes (``_init``, ``append`` in dict mode) go to
+    the underlying ``_log_probs_data`` attribute.
+    """
+
     beam_width: int = -1
-    log_probs: list[TokenLogprobs]
     cum_log_probs: list[float]
+
+    def __init__(self):
+        self.beam_width = -1
+        self._log_probs_data: list[TokenLogprobs] = []
+        self.cum_log_probs = []
+        # Flat-mode storage (unused when not in flat mode).
+        self._flat_token_ids: list[list[int]] = []
+        self._flat_logprobs: list[list[float]] = []
+        self._flat_materialized_len: list[int] = []
+
+    @property
+    def log_probs(self) -> list[TokenLogprobs]:
+        self._ensure_materialized()
+        return self._log_probs_data
+
+    @log_probs.setter
+    def log_probs(self, value: list[TokenLogprobs]):
+        self._log_probs_data = value
+
+    @property
+    def log_probs_flat(self) -> list[list[float]] | None:
+        """Raw per-beam logprob floats (fast-path storage).
+
+        Returns ``None`` if the flat storage was never populated (dict-only
+        path). Accessing this does NOT trigger materialization.
+        """
+        if not self._flat_logprobs:
+            return None
+        return self._flat_logprobs
+
+    @property
+    def log_probs_flat_token_ids(self) -> list[list[int]] | None:
+        """Per-beam token ids parallel to ``log_probs_flat``."""
+        if not self._flat_token_ids:
+            return None
+        return self._flat_token_ids
 
     def _init(self, first_input: list[TokenLogprobs]):
         self.beam_width = len(first_input)
-        self.log_probs = [[] for _ in range(self.beam_width)]
+        self._log_probs_data = [[] for _ in range(self.beam_width)]
         self.cum_log_probs = [0 for _ in range(self.beam_width)]
+        self._flat_token_ids = [[] for _ in range(self.beam_width)]
+        self._flat_logprobs = [[] for _ in range(self.beam_width)]
+        self._flat_materialized_len = [0 for _ in range(self.beam_width)]
+
+    def _init_flat(self, beam_width: int = 1):
+        self.beam_width = beam_width
+        self._log_probs_data = [[] for _ in range(beam_width)]
+        self.cum_log_probs = [0.0 for _ in range(beam_width)]
+        self._flat_token_ids = [[] for _ in range(beam_width)]
+        self._flat_logprobs = [[] for _ in range(beam_width)]
+        self._flat_materialized_len = [0 for _ in range(beam_width)]
+
+    def _ensure_materialized(self):
+        """Materialize any pending flat entries into the dict form."""
+        if self.beam_width == -1:
+            return
+        for beam_idx in range(self.beam_width):
+            flat_len = len(self._flat_logprobs[beam_idx])
+            start = self._flat_materialized_len[beam_idx]
+            if flat_len > start:
+                tokens = self._flat_token_ids[beam_idx]
+                floats = self._flat_logprobs[beam_idx]
+                # Tight list-comp materialization.
+                self._log_probs_data[beam_idx].extend(
+                    {tokens[i]: Logprob(logprob=floats[i])}
+                    for i in range(start, flat_len))
+                self._flat_materialized_len[beam_idx] = flat_len
+
+    def append_flat(self,
+                    token_ids: list[int],
+                    logprobs: list[float],
+                    beam_idx: int = 0):
+        """Fast path: append raw per-token logprob floats.
+
+        The dict form is not built here; it's lazily materialized on the next
+        read of ``log_probs``. This avoids constructing ``Logprob`` dataclass
+        instances and single-entry dicts in the sampler hot loop.
+        """
+        assert len(token_ids) == len(logprobs)
+        if self.beam_width == -1:
+            self._init_flat(1)
+        self._flat_token_ids[beam_idx].extend(token_ids)
+        self._flat_logprobs[beam_idx].extend(logprobs)
+        # Cheap tight sum over a pure-float list.
+        self.cum_log_probs[beam_idx] += sum(logprobs)
 
     def append(self,
                new_probs: list[TokenLogprobs],
@@ -233,7 +336,15 @@ class LogProbStorage:
 
         assert len(new_probs) == self.beam_width, "Beam width mismatch"
         for beam_idx, probs in enumerate(new_probs):
-            self.log_probs[beam_idx].extend(probs)
+            # Ensure any pending flat entries are materialized before dict
+            # appends so the indices stay in sync (shouldn't happen in
+            # practice — flat mode is all-or-nothing per request — but cheap).
+            self._ensure_materialized()
+            self._log_probs_data[beam_idx].extend(probs)
+            # Keep the flat-materialized counter consistent with the new length.
+            if self._flat_materialized_len:
+                self._flat_materialized_len[beam_idx] = len(
+                    self._log_probs_data[beam_idx])
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
             else:
@@ -388,6 +499,23 @@ class PyResult:
             self._log_probs.append(log_probs, cum_log_probs)
             self.diff.log_probs_list.append((log_probs, cum_log_probs))
 
+    def append_log_probs_flat(self,
+                              token_ids: list[int],
+                              logprobs: list[float],
+                              beam_idx: int = 0):
+        """Fast path for logprobs=1: append raw floats without building dicts.
+
+        Dict materialization is deferred to the first read of
+        ``self._log_probs.log_probs``. Paired with
+        ``FLAT_LOGPROBS_MODE`` in the sampler.
+
+        NOTE: does not populate ``diff.log_probs_list`` — PP rank sync for
+        logprobs is not wired for the flat path yet. Safe for pure-TP /
+        attention-DP setups; PP would need an analogous flat diff entry.
+        """
+        if self._log_probs:
+            self._log_probs.append_flat(token_ids, logprobs, beam_idx)
+
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
                              multimodal_lengths: List[int]):
         """Split concatenated embeddings by multimodal_lengths and create handles for each.
@@ -488,13 +616,31 @@ class PyResult:
 
     @property
     def log_probs(self) -> list[TokenLogprobs] | None:
-        if not self._log_probs or not hasattr(self._log_probs, 'log_probs'):
+        # Storage eagerly initializes cum_log_probs/_log_probs_data to empty
+        # lists in __init__ (unlike the original), so ``hasattr`` no longer
+        # distinguishes "pre-init" from "post-init". Gate on ``beam_width``
+        # instead so callers don't see an empty list where they expected
+        # ``None``.
+        if not self._log_probs or self._log_probs.beam_width == -1:
             return None
         return self._log_probs.log_probs
 
     @property
+    def log_probs_flat(self) -> list[list[float]] | None:
+        """Fast-path flat per-beam logprob floats; None if dict-only path."""
+        if not self._log_probs or self._log_probs.beam_width == -1:
+            return None
+        return self._log_probs.log_probs_flat
+
+    @property
+    def log_probs_flat_token_ids(self) -> list[list[int]] | None:
+        if not self._log_probs or self._log_probs.beam_width == -1:
+            return None
+        return self._log_probs.log_probs_flat_token_ids
+
+    @property
     def cum_log_probs(self) -> list[float] | None:
-        if not self._log_probs or not hasattr(self._log_probs, 'cum_log_probs'):
+        if not self._log_probs or self._log_probs.beam_width == -1:
             return None
         return self._log_probs.cum_log_probs
 
@@ -543,10 +689,10 @@ class PyResult:
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handles', 'additional_context_outputs',
-         'additional_generation_outputs', 'mrope_position_ids_handle',
-         'mrope_position_deltas_handle'))
+        ('context_logits', 'generation_logits', 'log_probs', 'log_probs_flat',
+         'log_probs_flat_token_ids', 'cum_log_probs', 'mm_embedding_handles',
+         'additional_context_outputs', 'additional_generation_outputs',
+         'mrope_position_ids_handle', 'mrope_position_deltas_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
@@ -792,7 +938,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # When using beam search we cannot incrementically update the logprobs in the result.
         # Instead we need to update all logprobs. In that case no deep copy is needed.
-        need_deep_copy_logprobs = self.py_result.log_probs and self.sampling_config.beam_width <= 1
+        # Check against the raw beam width (cheap) rather than the property
+        # ``log_probs`` which would trigger flat-mode materialization.
+        has_log_probs = (self.py_result._log_probs is not None
+                         and self.py_result._log_probs.beam_width != -1)
+        need_deep_copy_logprobs = has_log_probs and self.sampling_config.beam_width <= 1
         need_deep_copy_generation_logits = self.py_result._generation_logits is not None
         need_any_deep_copy = need_deep_copy_logprobs or need_deep_copy_generation_logits
         # Performs a deep copy of py_result._log_probs or py_result._generation_logits to eliminate race conditions
@@ -803,11 +953,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             # Move _log_probs to py_result and create a new empty LogProbStorage in self.py_result
             # This avoids performing a deepcopy
             if need_deep_copy_logprobs:
-                py_result._log_probs = self.py_result._log_probs
+                old_storage = self.py_result._log_probs
+                py_result._log_probs = old_storage
                 self.py_result._log_probs = LogProbStorage()
-                # Initialize the storage and adjust the cum_log_probs to the previous value
-                self.py_result._log_probs._init(py_result.log_probs)
-                self.py_result._log_probs.cum_log_probs = py_result.cum_log_probs
+                # Reinitialize the fresh storage WITHOUT triggering flat-mode
+                # materialization on the old one. We only need the beam_width
+                # and previous cum_log_probs to continue accumulating.
+                self.py_result._log_probs._init_flat(old_storage.beam_width)
+                self.py_result._log_probs.cum_log_probs = list(
+                    old_storage.cum_log_probs)
 
             # Perform copies of py_result._generation_logits
             if need_deep_copy_generation_logits:

@@ -189,7 +189,6 @@ class PARDWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        raw_logits = logits
         K = self.max_draft_len
 
         self._execute_guided_decoder_if_present(logits)
@@ -210,8 +209,10 @@ class PARDWorker(SpecWorkerBase):
         else:
             logits_for_accept = logits
 
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
-            logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
+        accepted_tokens, num_accepted_tokens, sampled_log_probs = (
+            self._sample_and_accept_draft_tokens_base(
+                logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
+            )
         )
 
         # Pad accepted_tokens from (batch, K+1) to (batch, 2K) to match sampler buffer
@@ -337,13 +338,14 @@ class PARDWorker(SpecWorkerBase):
             num_accepted_tokens,
         )
 
-        return {
-            "logits": raw_logits,
-            "new_tokens": accepted_tokens,
-            "new_tokens_lens": num_accepted_tokens,
-            "next_draft_tokens": next_draft_tokens,
-            "next_new_tokens": next_new_tokens,
-        }
+        return self._build_forward_outputs(
+            logits=logits,
+            new_tokens=accepted_tokens,
+            new_tokens_lens=num_accepted_tokens,
+            next_draft_tokens=next_draft_tokens,
+            next_new_tokens=next_new_tokens,
+            sampled_log_probs=sampled_log_probs,
+        )
 
     def draft_decoder(
         self,

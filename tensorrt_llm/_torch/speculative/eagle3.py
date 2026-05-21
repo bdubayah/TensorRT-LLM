@@ -449,12 +449,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        raw_logits = logits
-
         self._execute_guided_decoder_if_present(logits)
 
         # Sample and accept tokens
-        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+        accepted_tokens, num_accepted_tokens, sampled_log_probs = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata)
 
         sa_manager = getattr(spec_metadata.spec_resource_manager, 'sa_manager',
@@ -594,13 +592,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         attn_metadata.use_spec_decoding = True
 
-        return {
-            'logits': raw_logits,
-            'new_tokens': accepted_tokens,
-            'new_tokens_lens': num_accepted_tokens,
-            'next_draft_tokens': next_draft_tokens,
-            'next_new_tokens': next_new_tokens,
-        }
+        return self._build_forward_outputs(
+            logits=logits,
+            new_tokens=accepted_tokens,
+            new_tokens_lens=num_accepted_tokens,
+            next_draft_tokens=next_draft_tokens,
+            next_new_tokens=next_new_tokens,
+            sampled_log_probs=sampled_log_probs,
+        )
 
     def sample_and_accept_draft_tokens(
         self,

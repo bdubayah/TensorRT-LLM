@@ -159,13 +159,11 @@ class SAWorker(SpecWorkerBase):
         """
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
-        raw_logits = logits
-
         self._execute_guided_decoder_if_present(logits)
 
         # Step 1-2: Sample and verify draft tokens
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens(
-            input_ids, logits, spec_metadata, attn_metadata
+        accepted_tokens, num_accepted_tokens, sampled_log_probs = (
+            self._sample_and_accept_draft_tokens(input_ids, logits, spec_metadata, attn_metadata)
         )
 
         # Step 3-4: Extend SA and generate next draft tokens using GPU kernel
@@ -182,13 +180,14 @@ class SAWorker(SpecWorkerBase):
             num_accepted_tokens,
         )
 
-        return {
-            "logits": raw_logits,
-            "new_tokens": accepted_tokens,
-            "new_tokens_lens": num_accepted_tokens,
-            "next_draft_tokens": next_draft_tokens,
-            "next_new_tokens": next_new_tokens,
-        }
+        return self._build_forward_outputs(
+            logits=logits,
+            new_tokens=accepted_tokens,
+            new_tokens_lens=num_accepted_tokens,
+            next_draft_tokens=next_draft_tokens,
+            next_new_tokens=next_new_tokens,
+            sampled_log_probs=sampled_log_probs,
+        )
 
     def _sample_and_accept_draft_tokens(
         self,
@@ -242,15 +241,17 @@ class SAWorker(SpecWorkerBase):
             )
 
         # Use base implementation for sampling and acceptance
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
-            logits=logits,
-            draft_tokens=draft_tokens,
-            num_contexts=num_contexts,
-            batch_size=batch_size,
-            spec_metadata=spec_metadata,
+        accepted_tokens, num_accepted_tokens, sampled_log_probs = (
+            self._sample_and_accept_draft_tokens_base(
+                logits=logits,
+                draft_tokens=draft_tokens,
+                num_contexts=num_contexts,
+                batch_size=batch_size,
+                spec_metadata=spec_metadata,
+            )
         )
 
-        return accepted_tokens, num_accepted_tokens
+        return accepted_tokens, num_accepted_tokens, sampled_log_probs
 
     def _generate_draft_tokens(
         self,

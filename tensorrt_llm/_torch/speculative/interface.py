@@ -494,11 +494,15 @@ class SpecWorkerBase(nn.Module, ABC):
     Provides common functionality for sampling and token handling.
     """
 
-    def __init__(self, use_separate_draft_kv_cache: bool = False):
+    def __init__(self,
+                 use_separate_draft_kv_cache: bool = False,
+                 disable_flashinfer_sampling: bool = False):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens = get_force_num_accepted_tokens()
-        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.4"
+        self.use_flashinfer = (IS_FLASHINFER_AVAILABLE
+                               and flashinfer.__version__ >= "0.6.4"
+                               and not disable_flashinfer_sampling)
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
@@ -535,13 +539,13 @@ class SpecWorkerBase(nn.Module, ABC):
         next_new_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
-        return {
-            'logits': logits,
-            'new_tokens': accepted_tokens,
-            'new_tokens_lens': num_accepted_tokens,
-            'next_draft_tokens': next_draft_tokens,
-            'next_new_tokens': next_new_tokens
-        }
+        return self._build_forward_outputs(
+            logits=logits,
+            new_tokens=accepted_tokens,
+            new_tokens_lens=num_accepted_tokens,
+            next_draft_tokens=next_draft_tokens,
+            next_new_tokens=next_new_tokens,
+        )
 
     def skip_drafting(
         self,
@@ -558,12 +562,11 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
-
         if self.guided_decoder is not None:
             self.guided_decoder.execute(logits)
 
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
+        target_tokens, sampled_log_probs = self._sample_tokens_for_batch(
+            logits, spec_metadata, num_contexts, batch_size)
 
         accepted_tokens = torch.zeros((batch_size, 1),
                                       dtype=torch.int,
@@ -583,13 +586,14 @@ class SpecWorkerBase(nn.Module, ABC):
                                       device=logits.device)
         next_new_tokens[:, 0] = target_tokens
 
-        return {
-            'logits': logits,
-            'new_tokens': accepted_tokens,
-            'new_tokens_lens': num_accepted_tokens,
-            'next_draft_tokens': next_draft_tokens,
-            'next_new_tokens': next_new_tokens
-        }
+        return self._build_forward_outputs(
+            logits=logits,
+            new_tokens=accepted_tokens,
+            new_tokens_lens=num_accepted_tokens,
+            next_draft_tokens=next_draft_tokens,
+            next_new_tokens=next_new_tokens,
+            sampled_log_probs=sampled_log_probs.unsqueeze(1),
+        )
 
     def set_guided_decoder(self,
                            guided_decoder: "CapturableGuidedDecoder") -> bool:
@@ -676,17 +680,25 @@ class SpecWorkerBase(nn.Module, ABC):
                                          device=logits.device)
 
         # Sample tokens using per-request sampling parameters
-        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
-                                                      num_contexts, batch_size)
+        target_tokens, target_log_probs = self._sample_tokens_for_batch(
+            logits, spec_metadata, num_contexts, batch_size)
 
         # Context requests: only accept the sampled token (no draft tokens yet)
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
+        sampled_log_probs = torch.zeros((batch_size, runtime_draft_len + 1),
+                                        dtype=torch.float32,
+                                        device=logits.device)
+        sampled_log_probs[:num_contexts, 0] = target_log_probs[:num_contexts]
 
         # Generation requests: verify draft tokens against target tokens
         gen_target_tokens = target_tokens[num_contexts:].reshape(
             num_gens, runtime_draft_len + 1)
+        gen_target_log_probs = target_log_probs[num_contexts:].reshape(
+            num_gens, runtime_draft_len + 1)
         accepted_tokens[num_contexts:, :runtime_draft_len +
                         1] = gen_target_tokens
+        sampled_log_probs[num_contexts:, :runtime_draft_len +
+                          1] = gen_target_log_probs
 
         # Compare draft tokens with target tokens using cumulative product
         # Counts consecutive matches from the start
@@ -698,7 +710,7 @@ class SpecWorkerBase(nn.Module, ABC):
         num_accepted_tokens = self._apply_force_accepted_tokens(
             num_accepted_tokens, num_contexts, runtime_draft_len)
 
-        return accepted_tokens, num_accepted_tokens
+        return accepted_tokens, num_accepted_tokens, sampled_log_probs
 
     def _draft_sampler_greedy(self, logits: torch.Tensor, d2t=None):
         """
@@ -718,6 +730,27 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_tokens = d2t[draft_tokens] + draft_tokens
 
         return draft_tokens.type(torch.int32)
+
+    @staticmethod
+    def _build_forward_outputs(
+        logits: torch.Tensor,
+        *,
+        new_tokens: torch.Tensor,
+        new_tokens_lens: torch.Tensor,
+        next_draft_tokens: torch.Tensor,
+        next_new_tokens: torch.Tensor,
+        sampled_log_probs: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
+        outputs = {
+            "logits": logits,
+            "new_tokens": new_tokens,
+            "new_tokens_lens": new_tokens_lens,
+            "next_draft_tokens": next_draft_tokens,
+            "next_new_tokens": next_new_tokens,
+        }
+        if sampled_log_probs is not None:
+            outputs["sampled_log_probs"] = sampled_log_probs
+        return outputs
 
     def _execute_guided_decoder_if_present(self, logits):
         """Execute guided decoder on target model logits if available."""
@@ -834,7 +867,7 @@ class SpecWorkerBase(nn.Module, ABC):
         spec_metadata: SpecMetadata,
         num_contexts: int,
         batch_size: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Sample tokens from logits using per-request sampling parameters.
         Supports both greedy and non-greedy sampling.
@@ -847,6 +880,7 @@ class SpecWorkerBase(nn.Module, ABC):
 
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
+            sampled_log_probs: [num_tokens] - Logprob of sampled token ids
         """
         if spec_metadata.allow_advanced_sampling:
             from .one_model_sampler import sampling_batch_spec_dec_one_model
@@ -860,8 +894,12 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ps = spec_metadata.top_ps[:num_tokens]
 
             if self.use_flashinfer:
+                # FlashInfer's top-k kernel indexes per-row workspace sized
+                # by k; greedy rows arrive with k=iinfo(int32).max from
+                # populate_sampling_params_for_one_model, so clamp to vocab
+                # before the kernel to avoid out-of-bounds (bf897e6446).
                 top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
-                # Lazily initialize seed/offset tensors on correct device
+                # Lazily initialize seed/offset tensors on correct device.
                 if self.seed is None:
                     self.seed = torch.tensor([0],
                                              dtype=torch.int64,
@@ -872,7 +910,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 self.seed += 1
                 self.seed %= (2**31)
 
-            sampled_tokens = sampling_batch_spec_dec_one_model(
+            sampled_tokens, sampled_log_probs = sampling_batch_spec_dec_one_model(
                 logits,
                 temperatures,
                 top_ks,
@@ -882,5 +920,10 @@ class SpecWorkerBase(nn.Module, ABC):
                 offset=self.offset)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
+            sampled_log_probs = (torch.gather(
+                logits,
+                dim=-1,
+                index=sampled_tokens.long().unsqueeze(-1),
+            ).squeeze(-1) - torch.logsumexp(logits, dim=-1)).to(torch.float32)
 
-        return sampled_tokens
+        return sampled_tokens, sampled_log_probs
