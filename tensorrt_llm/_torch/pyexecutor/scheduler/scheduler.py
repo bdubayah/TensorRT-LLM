@@ -8,7 +8,7 @@ from typing import Optional, Set
 from strenum import StrEnum
 
 from tensorrt_llm.bindings import internal as tb_internal
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, PythonCapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 
 # Assuming these imports exist in your environment
@@ -26,6 +26,19 @@ SchedulerOutput = namedtuple(
         "num_fitting_requests",
     ],
 )
+
+
+def get_kv_cache_window_sizes(kv_cache_manager) -> list[int]:
+    max_attention_window_vec = getattr(kv_cache_manager, "max_attention_window_vec", None)
+    if max_attention_window_vec is not None:
+        return sorted(set(max_attention_window_vec))
+
+    stats = kv_cache_manager.get_kv_cache_stats()
+    num_free_blocks_per_window_size = getattr(stats, "num_free_blocks_per_window_size", None)
+    if num_free_blocks_per_window_size is not None:
+        return sorted(dict(num_free_blocks_per_window_size).keys())
+
+    return [0]
 
 
 class ScheduledRequests:
@@ -232,11 +245,37 @@ class KVCacheV2DummyScheduler(CapacityScheduler):
     no_schedule_until_state = LlmRequestState.CONTEXT_INIT
     no_schedule_after_state = LlmRequestState.GENERATION_COMPLETE
 
-    def __init__(self, max_num_requests: int, kv_cache_manager, peft_cache_manager=None):
+    def __init__(
+        self,
+        max_num_requests: int,
+        kv_cache_manager,
+        peft_cache_manager=None,
+        python_capacity_scheduler_policy: Optional[PythonCapacitySchedulerPolicy] = None,
+    ):
         super(KVCacheV2DummyScheduler, self).__init__()
         self.max_num_requests = max_num_requests
         self.kv_cache_manager = kv_cache_manager
         self.peft_cache_manager = peft_cache_manager
+        self.python_capacity_scheduler_policy = python_capacity_scheduler_policy
+
+    def _sort_context_requests_by_remaining_blocks(self, requests: RequestList) -> RequestList:
+        if (
+            self.python_capacity_scheduler_policy
+            != PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+        ):
+            return requests
+
+        context_requests = [req for req in requests if req.is_context_init_state]
+        if len(context_requests) < 2:
+            return requests
+
+        sorted_context_requests = sorted(
+            context_requests,
+            key=lambda req: self.kv_cache_manager.get_needed_resource_to_completion(req),
+        )
+        sorted_context_iter = iter(sorted_context_requests)
+
+        return [next(sorted_context_iter) if req.is_context_init_state else req for req in requests]
 
     def _get_max_peft_pages(self) -> int:
         if self.peft_cache_manager is None:
@@ -301,7 +340,7 @@ class KVCacheV2DummyScheduler(CapacityScheduler):
             available_peft_pages -= claimed_peft_pages
 
         available_blocks = max_blocks - reserved_blocks
-        for request in pending_requests:
+        for request in self._sort_context_requests_by_remaining_blocks(pending_requests):
             req_state = request.state
             if len(scheduled_requests) >= self.max_num_requests:
                 break
@@ -321,6 +360,11 @@ class KVCacheV2DummyScheduler(CapacityScheduler):
                     scheduled_requests.append(request)
                     available_blocks -= needed_blocks
                 elif needed_blocks > available_blocks:
+                    if (
+                        self.python_capacity_scheduler_policy
+                        == PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+                    ):
+                        continue
                     # If one requests fails to be scheduled, break
                     break
 
@@ -879,7 +923,10 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
             if has_peft:
                 available_peft_pages -= claimed_peft_pages
 
-            for requests in [pending_dis_gen_init_requests, pending_requests]:
+            for requests in [
+                pending_dis_gen_init_requests,
+                scheduler._sort_context_requests_by_remaining_blocks(pending_requests),
+            ]:
                 for req in requests:
                     if (
                         not self.static_batch
@@ -903,6 +950,12 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                             enough_cross_blocks = reserved_cross_blocks.enough_available_blocks(req)
 
                         if not enough_blocks or not enough_cross_blocks:
+                            if (
+                                scheduler.python_capacity_scheduler_policy
+                                == PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+                                and req.is_context_init_state
+                            ):
+                                continue
                             break
 
                         # PEFT check only when needed
@@ -956,7 +1009,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         scheduled_requests: RequestList = []
         paused_requests: RequestList = []
 
-        requests_list = list(active_requests)
+        requests_list = scheduler._sort_context_requests_by_remaining_blocks(list(active_requests))
         req_it_end = len(requests_list)
         req_it = 0
 
@@ -1005,6 +1058,12 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                         f"MaxUtilizationScheduler: request ID {paused_req.request_id} -> pause"
                     )
                     req_it_end = last_started_idx
+                elif (
+                    scheduler.python_capacity_scheduler_policy
+                    == PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+                    and req.is_context_init_state
+                ):
+                    req_it += 1
                 else:
                     break
 
@@ -1101,7 +1160,7 @@ class MaxUtilizationScheduledBlocksManager:
         """
         self.kv_cache_manager = kv_cache_manager
         self.two_steps_look_ahead = two_steps_look_ahead
-        window_sizes = set(kv_cache_manager.max_attention_window_vec)
+        window_sizes = set(get_kv_cache_window_sizes(kv_cache_manager))
         self.num_scheduled_blocks: dict[int, int] = {ws: 0 for ws in window_sizes}
 
     def prepare_blocks_if_schedulable(self, req: LlmRequest) -> Optional[dict[int, int]]:
@@ -1169,6 +1228,7 @@ class PyCapacityScheduler:
         two_step_lookahead: bool = False,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_COMPLETE,
+        python_capacity_scheduler_policy: Optional[PythonCapacitySchedulerPolicy] = None,
     ):
         """
         Initialize the capacity scheduler.
@@ -1191,6 +1251,7 @@ class PyCapacityScheduler:
         self.two_step_lookahead = two_step_lookahead
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
+        self.python_capacity_scheduler_policy = python_capacity_scheduler_policy
         # Cache state values to avoid repeated .value access (optimization)
         self._no_schedule_until_state_value = no_schedule_until_state.value
         self._no_schedule_after_state_value = no_schedule_after_state.value
@@ -1369,6 +1430,42 @@ class PyCapacityScheduler:
             return True
         return self._can_be_scheduled(req)
 
+    def _get_request_remaining_blocks_sort_key(self, req: LlmRequest) -> tuple[int, ...]:
+        key: list[int] = []
+
+        if self.kv_cache_manager is not None:
+            for window_size in get_kv_cache_window_sizes(self.kv_cache_manager):
+                key.append(
+                    self.kv_cache_manager.get_remaining_blocks_to_completion(req, window_size)
+                )
+
+        if self.cross_kv_cache_manager is not None:
+            for window_size in get_kv_cache_window_sizes(self.cross_kv_cache_manager):
+                key.append(
+                    self.cross_kv_cache_manager.get_remaining_blocks_to_completion(req, window_size)
+                )
+
+        return tuple(key)
+
+    def _sort_context_requests_by_remaining_blocks(self, requests: RequestList) -> RequestList:
+        if (
+            self.python_capacity_scheduler_policy
+            != PythonCapacitySchedulerPolicy.SHORTEST_MISSED_BLOCKS_FIRST
+        ):
+            return requests
+
+        context_requests = [req for req in requests if req.is_context_init_state]
+        if len(context_requests) < 2:
+            return requests
+
+        sorted_context_requests = sorted(
+            context_requests,
+            key=self._get_request_remaining_blocks_sort_key,
+        )
+        sorted_context_iter = iter(sorted_context_requests)
+
+        return [next(sorted_context_iter) if req.is_context_init_state else req for req in requests]
+
     def schedule_request(
         self, active_requests: RequestList
     ) -> tuple[RequestList, RequestList, RequestList]:
@@ -1421,6 +1518,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         cross_kv_cache_manager=None,
         two_step_lookahead: bool = False,
         scheduler_capacity: Optional[int] = None,
+        python_capacity_scheduler_policy: Optional[PythonCapacitySchedulerPolicy] = None,
     ):
         # Use scheduler_capacity if provided, otherwise fall back to max_batch_size
         # scheduler_capacity may differ from max_batch_size (e.g., adjusted for attention_dp + disagg)
@@ -1435,6 +1533,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
             scheduler_policy=scheduler_policy,
             cross_kv_cache_manager=cross_kv_cache_manager,
             two_step_lookahead=two_step_lookahead,
+            python_capacity_scheduler_policy=python_capacity_scheduler_policy,
         )
 
         # 2. Initialize Python MicroBatch Scheduler

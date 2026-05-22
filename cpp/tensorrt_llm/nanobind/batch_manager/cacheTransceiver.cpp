@@ -44,7 +44,7 @@ class PyCacheTransceiver : public tb::BaseCacheTransceiver
 {
 public:
     // using BaseCacheTransceiver::BaseCacheTransceiver; // Inherit constructors
-    NB_TRAMPOLINE(tb::BaseCacheTransceiver, 6);
+    NB_TRAMPOLINE(tb::BaseCacheTransceiver, 8);
 
     void respondAndSendAsync(tb::LlmRequest* llmRequest) override
     {
@@ -75,6 +75,11 @@ public:
     bool checkGenTransferComplete() const override
     {
         NB_OVERRIDE_PURE(checkGenTransferComplete);
+    }
+
+    bool hasPendingGenTransfer(tb::LlmRequest* llmRequest) const override
+    {
+        NB_OVERRIDE_PURE(hasPendingGenTransfer, llmRequest);
     }
 
     bool cancelRequest(tb::LlmRequest* llmRequest) override
@@ -110,6 +115,7 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
             nb::call_guard<nb::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
+        .def("has_pending_gen_transfer", &BaseCacheTransceiver::hasPendingGenTransfer)
         .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")

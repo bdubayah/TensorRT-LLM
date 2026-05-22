@@ -120,6 +120,10 @@ class KvCacheTransceiver(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def has_pending_gen_transfer(self, req: LlmRequest):
+        raise NotImplementedError
+
+    @abstractmethod
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError
 
@@ -202,6 +206,9 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def check_gen_transfer_complete(self):
         return self.impl.check_gen_transfer_complete()
+
+    def has_pending_gen_transfer(self, req: LlmRequest):
+        return self.impl.has_pending_gen_transfer(req)
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)

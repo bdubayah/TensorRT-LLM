@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,8 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <atomic>
+#include <chrono>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -49,6 +51,62 @@ namespace kv_cache_manager
 {
 class BaseKVCacheManager;
 } // namespace kv_cache_manager
+
+namespace detail
+{
+
+struct TransferFuture
+{
+    //! Keep a stable request id because the request object can be cleaned up
+    //! before the async transfer future is drained from mSenderFutures.
+    TransferFuture(LlmRequest::RequestIdType requestId_, LlmRequest* request_, std::future<void>&& future_,
+        std::shared_ptr<std::atomic<bool>> hasError_ = nullptr)
+        : requestId(requestId_)
+        , request(request_)
+        , future(std::move(future_))
+        , hasError(std::move(hasError_))
+    {
+    }
+
+    TransferFuture(
+        LlmRequest* request_, std::future<void>&& future_, std::shared_ptr<std::atomic<bool>> hasError_ = nullptr)
+        : TransferFuture(request_->mRequestId, request_, std::move(future_), std::move(hasError_))
+    {
+    }
+
+    LlmRequest::RequestIdType requestId;
+    LlmRequest* request;
+    std::future<void> future;
+    std::shared_ptr<std::atomic<bool>> hasError;
+};
+
+template <typename FutureContainer>
+std::vector<LlmRequest::RequestIdType> getReadyTransferRequestIds(FutureContainer const& futures)
+{
+    std::vector<LlmRequest::RequestIdType> readyRequestIds;
+    for (auto const& transferFuture : futures)
+    {
+        if (transferFuture.future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+        {
+            readyRequestIds.push_back(transferFuture.requestId);
+        }
+    }
+    return readyRequestIds;
+}
+
+template <typename FutureContainer>
+void detachTransferRequests(FutureContainer& futures, LlmRequest::RequestIdType requestId)
+{
+    for (auto& transferFuture : futures)
+    {
+        if (transferFuture.requestId == requestId)
+        {
+            transferFuture.request = nullptr;
+        }
+    }
+}
+
+} // namespace detail
 
 class CacheSender;
 class CacheReceiver;
@@ -221,6 +279,8 @@ public:
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
+    [[nodiscard]] virtual bool hasPendingGenTransfer(LlmRequest* llmRequest) const = 0;
+
     virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
 };
 
@@ -267,6 +327,8 @@ public:
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
+    [[nodiscard]] bool hasPendingGenTransfer(LlmRequest* llmRequest) const override;
+
     virtual bool cancelRequest(LlmRequest* llmRequest) override;
 
 private:
@@ -276,8 +338,8 @@ private:
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
+    std::vector<detail::TransferFuture> mSenderFutures;
+    std::vector<detail::TransferFuture> mRequesterFutures;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;

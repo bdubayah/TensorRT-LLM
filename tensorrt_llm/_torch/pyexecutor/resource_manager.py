@@ -839,6 +839,25 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.store_blocks_for_reuse(request.py_request_id, request,
                                                 pin_blocks)
 
+    def estimate_reusable_prompt_len(self, request: LlmRequest) -> int:
+        if (not self.enable_block_reuse or self.enable_partial_reuse
+                or self.is_vswa or not request.is_first_context_chunk):
+            return 0
+
+        unique_tokens = request.get_unique_tokens(DEFAULT_BEAM_INDEX)[:-1]
+        reusable_tokens_cap = (len(unique_tokens) //
+                               self.tokens_per_block) * self.tokens_per_block
+        if reusable_tokens_cap == 0:
+            return 0
+
+        new_context_block = self.impl.find_new_context_block(
+            unique_tokens, request)
+        if new_context_block is None:
+            return reusable_tokens_cap
+
+        return max(
+            len(new_context_block.unique_tokens) - self.tokens_per_block, 0)
+
     @staticmethod
     def calculate_scaling_factor_size_bytes(
             cache_size: int, quant_vector_size: int,
@@ -1005,8 +1024,18 @@ class KVCacheManager(BaseResourceManager):
         assert len(result) == 1
         return result[0]
 
-    def unpin_blocks_by_id(self, kv_cache_block_id: int):
-        self.impl.unpin_blocks_by_id(kv_cache_block_id)
+    def get_all_cache_indices(self, request: LlmRequest) -> List[int]:
+        block_ids: List[int] = []
+        seen_block_ids = set()
+        for window_size in self.max_attention_window_vec:
+            for block_id in self.get_cache_indices(request, window_size):
+                if block_id not in seen_block_ids:
+                    seen_block_ids.add(block_id)
+                    block_ids.append(block_id)
+        return block_ids
+
+    def unpin_blocks_by_id(self, kv_cache_block_ids: List[int]):
+        self.impl.unpin_blocks_by_id(kv_cache_block_ids)
 
     def get_last_block_id(self, request_id: int) -> int:
         return self.impl.get_last_block_id(request_id)

@@ -367,6 +367,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
     def check_gen_transfer_complete(self):
         return len(self.recv_sessions) == 0
 
+    def has_pending_gen_transfer(self, req: LlmRequest):
+        return req.py_request_id in self.recv_sessions
+
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError("cancel_request is not implemented")
 

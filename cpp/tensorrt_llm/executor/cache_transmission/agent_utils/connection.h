@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -304,6 +304,9 @@ public:
     AgentConnectionManager(std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers,
         CacheState cacheState, std::string const& backendType,
         std::optional<CacheState::RnnCacheState> rnnCacheState = std::nullopt);
+    AgentConnectionManager(std::vector<batch_manager::BaseTransBufferManager*> cacheTransBufferManagers,
+        CacheState cacheState, std::string agentName, std::unique_ptr<BaseTransferAgent> agent,
+        std::optional<CacheState::RnnCacheState> rnnCacheState = std::nullopt);
     ~AgentConnectionManager();
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
@@ -327,8 +330,11 @@ public:
     void waitForReadySignal(
         std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag);
     [[nodiscard]] bool isRunning() const override;
+    void throwIfTransportFailed() const;
 
 private:
+    void initialize();
+    void recordTransportFailure(std::string message);
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
     std::mutex mConnectionsMutex;
     CommState mCommState;
@@ -343,6 +349,8 @@ private:
     std::string mAgentName;
     MemoryDescs mRegMemDescs;
     std::atomic<bool> mIsRunning{true};
+    mutable std::mutex mTransportFailureMutex;
+    std::optional<std::string> mTransportFailure;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

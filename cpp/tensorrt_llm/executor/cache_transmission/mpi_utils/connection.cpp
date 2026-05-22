@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <chrono>
+#include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -51,7 +53,22 @@ MpiConnection const* MpiConnectionManager::recvConnect(DataContext const& ctx, v
 {
 #if ENABLE_MULTI_DEVICE
     MPI_Status status;
-    MPI_Recv(data, size, MPI_CHAR, MPI_ANY_SOURCE, ctx.getTag(), static_cast<MPI_Comm>(*mComm), std::addressof(status));
+    int hasMessage = 0;
+    while (!ctx.getTransferTerminate().load())
+    {
+        MPI_Iprobe(MPI_ANY_SOURCE, ctx.getTag(), static_cast<MPI_Comm>(*mComm), &hasMessage, std::addressof(status));
+        if (hasMessage != 0)
+        {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (hasMessage == 0)
+    {
+        return nullptr;
+    }
+    MPI_Recv(
+        data, size, MPI_CHAR, status.MPI_SOURCE, ctx.getTag(), static_cast<MPI_Comm>(*mComm), std::addressof(status));
     auto&& [it, success] = mConnections.insert({status.MPI_SOURCE, MpiConnection{mComm, status.MPI_SOURCE}});
     return std::addressof(it->second);
 #else

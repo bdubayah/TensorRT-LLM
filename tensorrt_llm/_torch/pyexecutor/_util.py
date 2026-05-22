@@ -1268,6 +1268,9 @@ def create_py_executor_instance(
         scheduler_capacity += 1
 
     use_python_scheduler = scheduler_config.use_python_scheduler if scheduler_config is not None else False
+    python_capacity_scheduler_policy = (
+        scheduler_config.python_capacity_scheduler_policy
+        if scheduler_config is not None else None)
     if use_python_scheduler and not isinstance(kv_cache_manager,
                                                KVCacheManagerV2):
         scheduler = SimpleUnifiedScheduler(
@@ -1279,6 +1282,7 @@ def create_py_executor_instance(
             if peft_cache_manager is not None else None,
             scheduler_policy=scheduler_config.capacity_scheduler_policy,
             ctx_chunk_config=ctx_chunk_config,
+            python_capacity_scheduler_policy=python_capacity_scheduler_policy,
             two_step_lookahead=mapping.has_pp(),
             scheduler_capacity=scheduler_capacity)
     else:
@@ -1286,8 +1290,8 @@ def create_py_executor_instance(
             capacity_scheduler = KVCacheV2DummyScheduler(
                 scheduler_capacity,
                 kv_cache_manager if kv_cache_manager is not None else None,
-                peft_cache_manager.impl
-                if peft_cache_manager is not None else None)
+                peft_cache_manager.impl if peft_cache_manager is not None else
+                None, python_capacity_scheduler_policy)
         else:
             capacity_scheduler = BindCapacityScheduler(
                 scheduler_capacity,

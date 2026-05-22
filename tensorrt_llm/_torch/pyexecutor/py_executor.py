@@ -5,10 +5,11 @@ import os
 import threading
 import time
 import traceback
+from collections import Counter
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -77,10 +78,16 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 
+_ADP_TRANSFER_NEED_CHECK = 1 << 0
+_ADP_TRANSFER_NOT_NEED_CHECK_ONE = 1 << 1
+_ADP_TRANSFER_HAS_ERROR = 1 << 2
+
 # Environment variable to control which ranks print step logging.
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
+
+DISAGG_TRANSFER_BACKPRESSURE_LOG_INTERVAL_SEC = 1.0
 
 
 class PPCommTag(IntEnum):
@@ -147,11 +154,16 @@ class AsyncTransferManager:
 
     class RequestTransferMetadata:
 
-        def __init__(self, block_id: Optional[int]):
-            self.block_id = block_id
+        def __init__(self, block_ids: Optional[List[int]]):
+            self.block_ids = block_ids
             self.counter = 0
+            self.started_sources: set[str] = set()
 
-        def start_transfer(self):
+        def start_transfer(self, source: str) -> None:
+            if source in self.started_sources:
+                return
+
+            self.started_sources.add(source)
             self.counter += 1
 
         def end_transfer(self) -> bool:
@@ -181,12 +193,14 @@ class AsyncTransferManager:
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
         return self._requests_in_transfer
 
-    def start_transfer(self, request: LlmRequest):
+    def start_transfer(self,
+                       request: LlmRequest,
+                       source: str = "unknown") -> None:
         """
         Called when a Cache transceiver or connector transfer is started.
         1. Increment the counter for the request.
         2. Releases all resources except for the KV cache, if not already released.
-        3. Store KV cache blocks for reuse.
+        3. Pin KV cache blocks so they stay alive while transfer is in flight.
         """
 
         req_id = request.py_request_id
@@ -203,16 +217,18 @@ class AsyncTransferManager:
             request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
             if self.should_store_blocks:
-                block_id = self.kv_cache_manager.store_blocks_for_reuse(
-                    request, True)
+                block_ids = self.kv_cache_manager.get_all_cache_indices(request)
+                if block_ids:
+                    self.kv_cache_manager.pin_blocks(req_id)
             else:
-                block_id = None
+                block_ids = None
 
             self._requests_in_transfer[req_id] = request
             self._request_transfer_metadata[
-                req_id] = self.RequestTransferMetadata(block_id)
+                req_id] = self.RequestTransferMetadata(block_ids)
 
-        self._request_transfer_metadata[req_id].start_transfer()
+        transfer_metadata = self._request_transfer_metadata[req_id]
+        transfer_metadata.start_transfer(source)
 
     def end_transfer(self, request: LlmRequest) -> bool:
         """
@@ -227,18 +243,19 @@ class AsyncTransferManager:
             transfer_metadata = self._request_transfer_metadata[
                 request.py_request_id]
         except KeyError:
-            logger.warning(
-                f"Request {request.py_request_id} not found in transfer manager"
+            logger.debug(
+                "Ignoring late transfer cleanup for request_id=%s that was already removed locally",
+                request.py_request_id,
             )
-            return
+            return False
 
         if transfer_metadata.end_transfer():
             self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
 
-            if self.should_store_blocks:
+            if self.should_store_blocks and transfer_metadata.block_ids:
                 self.kv_cache_manager.unpin_blocks_by_id(
-                    transfer_metadata.block_id)
+                    transfer_metadata.block_ids)
 
             # We don't want to overwrite any error state.
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
@@ -361,6 +378,7 @@ class PyExecutor:
             None) if spec_config is not None else None
         self.speculation_permanently_disabled = False
         self.speculation_gate = None
+        self._last_disagg_transfer_backpressure_log_time = 0.0
         if self.acceptance_window and self.acceptance_length_threshold is not None:
             self.speculation_gate = SpeculationGate(
                 self.acceptance_window, self.acceptance_length_threshold)
@@ -569,7 +587,12 @@ class PyExecutor:
 
     def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
         if self.async_transfer_manager.end_transfer(request):
-            self._terminate_request(request)
+            # When should_store_blocks is True, _handle_responses already
+            # terminated this request via the early-termination path
+            # (enable_partial_reuse_for_disagg branch). Skip the redundant
+            # termination to avoid double free_resources calls.
+            if not self.async_transfer_manager.should_store_blocks:
+                self._terminate_request(request)
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
@@ -1204,6 +1227,125 @@ class PyExecutor:
                 self.active_requests)
         return scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs
 
+    @staticmethod
+    def _get_request_state_name(request: LlmRequest) -> str:
+        state = request.state
+        return state.name if hasattr(state, "name") else str(state)
+
+    def _get_request_state_counts(
+            self, requests: Iterable[LlmRequest]) -> Dict[str, int]:
+        state_counts = Counter()
+        for request in requests:
+            state_counts[self._get_request_state_name(request)] += 1
+        return dict(sorted(state_counts.items()))
+
+    def _maybe_log_disagg_transfer_backpressure(
+            self,
+            reason: str,
+            *,
+            num_fitting_reqs: Optional[int] = None,
+            fitting_disagg_gen_init_count: Optional[int] = None,
+            at_least_num: Optional[int] = None) -> None:
+        now = time.monotonic()
+        if (now - self._last_disagg_transfer_backpressure_log_time
+                < DISAGG_TRANSFER_BACKPRESSURE_LOG_INTERVAL_SEC):
+            return
+
+        self._last_disagg_transfer_backpressure_log_time = now
+
+        requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
+        )
+        request_ids_in_transfer = sorted(requests_in_transfer.keys())
+        sample_request_ids = request_ids_in_transfer[:8]
+
+        logger.debug(
+            "[disagg-transfer-backpressure] "
+            f"rank={self.global_rank} tp_rank={self.dist.tp_rank} "
+            f"pp_rank={self.dist.pp_rank} reason={reason} "
+            f"waiting_queue={len(self.waiting_queue)} "
+            f"local_active={len(self.active_requests)} "
+            f"requests_in_transfer={len(requests_in_transfer)} "
+            f"active_state_counts={self._get_request_state_counts(self.active_requests)} "
+            f"transfer_state_counts={self._get_request_state_counts(requests_in_transfer.values())} "
+            f"num_fitting_reqs={num_fitting_reqs} "
+            f"fitting_disagg_gen_init_count={fitting_disagg_gen_init_count} "
+            f"at_least_num={at_least_num} "
+            f"sample_request_ids={sample_request_ids}")
+
+    def _should_apply_schedulable_reuse_preview(self) -> bool:
+        # Preview KV reuse before scheduling so the scheduler accounts for the
+        # uncached prompt tokens that still need compute, rather than the full
+        # remaining prompt length. This lets multiple mostly-cached requests fit
+        # into the same chunk when their actual remaining work is small. Apply
+        # it only when local KV reuse can estimate whole-request reuse; partial
+        # reuse and VSWA already have more specific allocation behavior, and
+        # the KV connector path should not mutate prepopulation state before
+        # connector-managed cache loading runs.
+        return (self.enable_kv_cache_reuse
+                and self.kv_cache_manager is not None and hasattr(
+                    self.kv_cache_manager, "estimate_reusable_prompt_len")
+                and not self.kv_cache_manager.enable_partial_reuse
+                and not self.kv_cache_manager.is_vswa
+                and self.kv_connector_manager is None)
+
+    def _capture_schedulable_reuse_state(
+            self, request: LlmRequest) -> Tuple[int, int, int]:
+        return (request.context_current_position, request.context_chunk_size,
+                request.prepopulated_prompt_len)
+
+    def _restore_schedulable_reuse_state(self, request: LlmRequest,
+                                         state: Tuple[int, int, int]) -> None:
+        context_current_position, context_chunk_size, prepopulated_prompt_len = state
+        request.set_prepopulated_prompt_len(
+            prepopulated_prompt_len, self.kv_cache_manager.tokens_per_block)
+        request.context_current_position = context_current_position
+        request.context_chunk_size = context_chunk_size
+
+    def _capture_schedulable_reuse_states(
+        self, requests: List[LlmRequest], previewed_states: Dict[int,
+                                                                 Tuple[int, int,
+                                                                       int]]
+    ) -> Dict[int, Tuple[int, int, int]]:
+        return {
+            request.request_id: self._capture_schedulable_reuse_state(request)
+            for request in requests if request.request_id in previewed_states
+        }
+
+    def _restore_schedulable_reuse_states(
+            self, requests: List[LlmRequest],
+            states: Dict[int, Tuple[int, int, int]]) -> None:
+        restored_request_ids = set()
+        for request in requests:
+            request_state = states.get(request.request_id)
+            if (request_state is None
+                    or request.request_id in restored_request_ids):
+                continue
+            self._restore_schedulable_reuse_state(request, request_state)
+            restored_request_ids.add(request.request_id)
+
+    def _apply_schedulable_reuse_preview(
+            self,
+            requests: List[LlmRequest]) -> Dict[int, Tuple[int, int, int]]:
+        if not self._should_apply_schedulable_reuse_preview():
+            return {}
+
+        previewed_states: Dict[int, Tuple[int, int, int]] = {}
+        for request in requests:
+            if not request.is_context_init_state or not request.is_first_context_chunk:
+                continue
+
+            reusable_prompt_len = self.kv_cache_manager.estimate_reusable_prompt_len(
+                request)
+            if reusable_prompt_len <= request.prepopulated_prompt_len:
+                continue
+
+            previewed_states[request.request_id] = (
+                self._capture_schedulable_reuse_state(request))
+            request.set_prepopulated_prompt_len(
+                reusable_prompt_len, self.kv_cache_manager.tokens_per_block)
+
+        return previewed_states
+
     def _pp_retry_until_can_schedule(self, scheduled_batch):
         """
         If current rank cannot run the scheduled batch, it will retry following steps until it has enough KV cache resources or reach maximum retry count:
@@ -1262,7 +1404,8 @@ class PyExecutor:
                     iter_start_time = time.time()
 
                 # Fetch new requests from request queue
-                new_requests = self._fetch_and_activate_new_requests()
+                new_requests = self._fetch_and_activate_new_requests_after_transfer_cleanup(
+                )
                 if self.should_stop_processing:
                     break
 
@@ -1587,19 +1730,28 @@ class PyExecutor:
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
+                sample_state_scheduled_requests = executed_batch.scheduled_requests
+                attn_metadata = getattr(self.model_engine, 'attn_metadata',
+                                        None)
+                kv_cache_dtype_byte_size = getattr(self.model_engine,
+                                                   'kv_cache_dtype_byte_size',
+                                                   None)
+                # Store context blocks before _handle_responses
+                # because handle_responses can terminate requests and
+                # remove sequences from the KV cache manager.
+                self.resource_manager.update_resources(
+                    sample_state_scheduled_requests, attn_metadata,
+                    kv_cache_dtype_byte_size)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
                 self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
-                attn_metadata = getattr(self.model_engine, 'attn_metadata',
-                                        None)
-                kv_cache_dtype_byte_size = getattr(self.model_engine,
-                                                   'kv_cache_dtype_byte_size',
-                                                   None)
-                self.resource_manager.update_resources(
-                    scheduled_requests, attn_metadata, kv_cache_dtype_byte_size)
+                # Complete ctx send sessions AFTER responses are created so
+                # _handle_responses sees the request before it is terminated.
+                if self.kv_cache_transceiver:
+                    self._check_disagg_ctx_cache_transfer_status(0)
 
                 self._remove_inflight_ids(scheduled_requests)
 
@@ -1688,7 +1840,8 @@ class PyExecutor:
         return can_queue, can_queue_this_rank
 
     def _prepare_and_schedule_batch(self):
-        new_requests = self._fetch_and_activate_new_requests()
+        new_requests = self._fetch_and_activate_new_requests_after_transfer_cleanup(
+        )
         if self.should_stop_processing:
             return None, None
 
@@ -1696,6 +1849,11 @@ class PyExecutor:
             self._check_disagg_ctx_schedulable_status(new_requests)
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
+            if (getattr(self, "enable_attention_dp", False)
+                    and self._kv_transfer_timeout_recovery_enabled()):
+                self._sync_adp_generation_transfer_timeouts()
+                self._check_cache_transfer_errors("generation requests",
+                                                  align_across_adp=True)
 
         # In benchmark disagg mode, fetch requests in batches to avoid
         # blocking the CTX→GEN KV cache pipeline. With ADP, fetch tp_size
@@ -1715,7 +1873,8 @@ class PyExecutor:
                             f"{fill_target}, "
                             f"len(active_requests)={len(self.active_requests)}")
             while self.num_fetch_requests < fill_target:
-                iter_requests = self._fetch_and_activate_new_requests()
+                iter_requests = self._fetch_and_activate_new_requests_after_transfer_cleanup(
+                )
                 if self.should_stop_processing:
                     return None, None
                 new_requests += iter_requests
@@ -1935,21 +2094,23 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
 
-                    self._send_kv_async(scheduled_batch.all_requests())
-
+                    attn_metadata = getattr(self.model_engine, 'attn_metadata',
+                                            None)
+                    kv_cache_dtype_byte_size = getattr(
+                        self.model_engine, 'kv_cache_dtype_byte_size', None)
                     self._handle_canceled_requests()
+                    self.resource_manager.update_resources(
+                        scheduled_batch, attn_metadata,
+                        kv_cache_dtype_byte_size)
+                    if self.kv_cache_transceiver or self.kv_connector_manager:
+                        # Finalize the last context chunk before the async transfer
+                        # reads it, so disagg observes committed KV state.
+                        self._send_kv_async(scheduled_batch.all_requests())
                     finished_requests = self._handle_responses()
                     # Compute GPU times after _handle_responses creates metric entries
                     # (safe in non-overlap mode: no next iteration to overwrite events)
                     self.perf_manager.compute_batch_gpu_times(
                         scheduled_batch.all_requests())
-                    attn_metadata = getattr(self.model_engine, 'attn_metadata',
-                                            None)
-                    kv_cache_dtype_byte_size = getattr(
-                        self.model_engine, 'kv_cache_dtype_byte_size', None)
-                    self.resource_manager.update_resources(
-                        scheduled_batch, attn_metadata,
-                        kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
@@ -2358,15 +2519,17 @@ class PyExecutor:
         return result_tensors, num_accepted_tokens
 
     def _process_previous_batch(self):
-        self._handle_canceled_requests()
-        finished_requests = self._handle_responses()
         scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
+        # Store context blocks before _handle_responses, because handle_responses can
+        # terminate requests and remove sequences from the KV cache manager.
         self.resource_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
+        self._handle_canceled_requests()
+        finished_requests = self._handle_responses()
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
@@ -2587,6 +2750,19 @@ class PyExecutor:
     def _should_exclude_last_generation_logits(self) -> bool:
         return self.should_exclude_last_generation_logits
 
+    def _fetch_and_activate_new_requests_after_transfer_cleanup(
+            self) -> List[LlmRequest]:
+        if self.kv_cache_transceiver:
+            if getattr(self, "enable_attention_dp", False):
+                self._check_disagg_gen_transfer_status()
+                if self._kv_transfer_timeout_recovery_enabled():
+                    self._check_kv_transfer_timeout()
+                    self._sync_adp_generation_transfer_timeouts()
+            self._check_cache_transfer_errors("generation requests",
+                                              align_across_adp=True)
+
+        return self._fetch_and_activate_new_requests()
+
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
@@ -2699,23 +2875,36 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
-        scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+        previewed_states = self._apply_schedulable_reuse_preview(
+            self.active_requests)
+        scheduled_context_requests: List[LlmRequest] = []
+        scheduled_context_states: Dict[int, Tuple[int, int, int]] = {}
+        try:
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests, self.inflight_req_ids)
 
-        scheduled_context_requests = scheduler_output.context_requests
-        if self.enable_attention_dp and self.attention_dp_enable_balance:
-            scheduled_context_requests = self._balance_adp_requests(
-                scheduler_output.context_requests,
-                scheduler_output.generation_requests)
+            scheduled_context_requests = scheduler_output.context_requests
+            if self.enable_attention_dp and self.attention_dp_enable_balance:
+                scheduled_context_requests = self._balance_adp_requests(
+                    scheduler_output.context_requests,
+                    scheduler_output.generation_requests)
 
-        # If no generation requests, no need to wait, to avoid dead waiting
-        should_check_waiting = not self.enable_attention_dp and self.enable_batch_waiting and len(
-            scheduler_output.context_requests) > 0 and len(
-                scheduler_output.generation_requests) > 0
-        if should_check_waiting:
-            scheduled_context_requests = self._waiting_requests(
-                scheduler_output.context_requests,
-                scheduler_output.generation_requests)
+            # If no generation requests, no need to wait, to avoid dead waiting
+            should_check_waiting = not self.enable_attention_dp and self.enable_batch_waiting and len(
+                scheduler_output.context_requests) > 0 and len(
+                    scheduler_output.generation_requests) > 0
+            if should_check_waiting:
+                scheduled_context_requests = self._waiting_requests(
+                    scheduler_output.context_requests,
+                    scheduler_output.generation_requests)
+
+            scheduled_context_states = self._capture_schedulable_reuse_states(
+                scheduled_context_requests, previewed_states)
+        finally:
+            self._restore_schedulable_reuse_states(self.active_requests,
+                                                   previewed_states)
+            self._restore_schedulable_reuse_states(scheduled_context_requests,
+                                                   scheduled_context_states)
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.reset_context_requests(scheduled_context_requests)
@@ -2727,20 +2916,60 @@ class PyExecutor:
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
 
-        need_check = any([
+        in_progress_requests = [
             req.is_disagg_generation_transmission_in_progress
             for req in self.active_requests
-        ])
-        need_check_one = all([
-            req.is_disagg_generation_transmission_in_progress
-            for req in self.active_requests
-        ])
+        ]
+        need_check = any(in_progress_requests)
+        need_check_one = need_check and all(in_progress_requests)
+        if (not need_check and
+                not self.kv_cache_transceiver.check_gen_transfer_complete()):
+            need_check = True
+            need_check_one = False
+        has_transfer_error = bool(self._get_disagg_reqs_in_error_state())
+
+        if getattr(self, "enable_attention_dp", False) and getattr(
+                self.dist, "world_size", 1) != 1:
+            check_flags = (int(need_check) * _ADP_TRANSFER_NEED_CHECK)
+            if not need_check_one:
+                check_flags |= _ADP_TRANSFER_NOT_NEED_CHECK_ONE
+            if has_transfer_error:
+                check_flags |= _ADP_TRANSFER_HAS_ERROR
+            all_rank_check_flags = self.dist.tp_allgather_int64([check_flags])
+            merged_flags = 0
+            for rank_flags in all_rank_check_flags:
+                merged_flags |= rank_flags[0]
+            need_check = bool(merged_flags & _ADP_TRANSFER_NEED_CHECK)
+            need_check_one = not bool(merged_flags
+                                      & _ADP_TRANSFER_NOT_NEED_CHECK_ONE)
+            has_transfer_error = bool(merged_flags & _ADP_TRANSFER_HAS_ERROR)
 
         if need_check:
             at_least_num = 1 if need_check_one else 0
-            self._check_disagg_gen_cache_transfer_status(at_least_num)
+            # With timeout-based recovery enabled, forcing one transfer to
+            # complete can wedge the event loop behind a dead peer before the
+            # timeout path gets a chance to cancel it.
+            if self._kv_transfer_timeout_recovery_enabled():
+                at_least_num = 0
+            self._check_disagg_gen_cache_transfer_status(
+                at_least_num, align_errors_across_adp=True)
+        elif has_transfer_error:
+            self._check_cache_transfer_errors("generation requests",
+                                              align_across_adp=True)
 
         return
+
+    def _kv_transfer_timeout_recovery_enabled(self) -> bool:
+        return (self.kv_cache_transceiver is not None and
+                self.kv_cache_transceiver.kv_transfer_timeout_ms is not None)
+
+    def _mark_timed_out_gen_transfer_if_locally_drained(
+            self, request: LlmRequest) -> None:
+        if request.state != LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+            return
+        if self.kv_cache_transceiver.has_pending_gen_transfer(request):
+            return
+        request.state = LlmRequestState.DISAGG_TRANS_ERROR
 
     @nvtx_range("_check_kv_transfer_timeout")
     def _check_kv_transfer_timeout(self):
@@ -2768,7 +2997,72 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_in_progress:
                 flag_if_kv_transfer_timed_out(req, "generation")
 
+        if not any(req.py_kv_transfer_timed_out
+                   for req in self.active_requests):
+            return
+
+        dist = getattr(self, "dist", None)
+        is_adp_collective = (getattr(self, "enable_attention_dp", False)
+                             and dist is not None
+                             and getattr(dist, "world_size", 1) != 1)
+        if is_adp_collective:
+            return
+
+        for request in self.active_requests:
+            if not request.py_kv_transfer_timed_out:
+                continue
+            if request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+                request.py_kv_transfer_start_time = None
+                if is_cancelled:
+                    self._mark_timed_out_gen_transfer_if_locally_drained(
+                        request)
+                if not is_cancelled:
+                    logger.warning(
+                        "Generation transfer cancel_request returned false "
+                        "request_id=%s state=%s",
+                        request.py_request_id,
+                        request.state,
+                    )
+
         return
+
+    @nvtx_range("_sync_adp_generation_transfer_timeouts")
+    def _sync_adp_generation_transfer_timeouts(self):
+        dist = getattr(self, "dist", None)
+        is_adp_collective = (getattr(self, "enable_attention_dp", False)
+                             and dist is not None
+                             and getattr(dist, "world_size", 1) != 1)
+        if not (is_adp_collective
+                and self._kv_transfer_timeout_recovery_enabled()):
+            return
+
+        local_timed_out_request_ids = [
+            request.py_request_id for request in self.active_requests
+            if (request.py_kv_transfer_timed_out and request.state ==
+                LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
+        ]
+        timed_out_request_ids = self._allgather_adp_request_ids(
+            local_timed_out_request_ids)
+        if not timed_out_request_ids:
+            return
+
+        for request in self.active_requests:
+            if request.py_request_id not in timed_out_request_ids:
+                continue
+            if request.state != LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                continue
+
+            request.py_kv_transfer_timed_out = True
+            request.py_kv_transfer_start_time = None
+            is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+            if is_cancelled:
+                self._mark_timed_out_gen_transfer_if_locally_drained(request)
+            else:
+                logger.warning(
+                    "Generation transfer cancel_request returned false "
+                    "while syncing ADP transfer timeout request_id=%s",
+                    request.py_request_id)
 
     @nvtx_range("_check_disagg_ctx_schedulable_status")
     def _check_disagg_ctx_schedulable_status(self,
@@ -2941,11 +3235,14 @@ class PyExecutor:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.time()
 
-        block_transfer = all([
-            req.is_disagg_generation_transmission_in_progress
-            for req in self.active_requests
-        ])
-        self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
+        if not (getattr(self, "enable_attention_dp", False)
+                and self._kv_transfer_timeout_recovery_enabled()):
+            block_transfer = all([
+                req.is_disagg_generation_transmission_in_progress
+                for req in self.active_requests
+            ])
+            self._check_disagg_gen_cache_transfer_status(
+                1 if block_transfer else 0)
 
         return
 
@@ -2962,7 +3259,8 @@ class PyExecutor:
             else:
                 if self.kv_connector_manager.request_finished(
                         req, cache_block_ids):
-                    self.async_transfer_manager.start_transfer(req)
+                    self.async_transfer_manager.start_transfer(
+                        req, source="kv_cache_connector")
 
         if self.kv_cache_transceiver:
             for req in scheduled_requests:
@@ -2971,7 +3269,8 @@ class PyExecutor:
                 ) and not req.is_finished_due_to_cancellation:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
-                    self.async_transfer_manager.start_transfer(req)
+                    self.async_transfer_manager.start_transfer(
+                        req, source="kv_cache_transceiver")
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
@@ -2996,9 +3295,205 @@ class PyExecutor:
             if req.state == LlmRequestState.DISAGG_TRANS_ERROR
         ]
 
-    def _check_cache_transfer_errors(self, error_msg_prefix: str):
+    def _get_cancel_request_id(self, request: LlmRequest) -> int:
+        return request.py_request_id if not request.is_child else request.parent_request_id
+
+    def _filter_canceled_gen_transfer_errors(
+            self,
+            error_requests: List[LlmRequest],
+            align_across_adp: bool = False) -> List[LlmRequest]:
+        dist = getattr(self, "dist", None)
+        should_align_responses = (align_across_adp and getattr(
+            self, "enable_attention_dp", False) and dist is not None
+                                  and getattr(dist, "world_size", 1) != 1)
+
+        canceled_req_ids = getattr(self, "canceled_req_ids", [])
+        canceled_req_ids_set = set(canceled_req_ids)
+        canceled_requests = [
+            request for request in error_requests
+            if request.is_generation_only_request() and (
+                request.is_finished_due_to_cancellation
+                or self._get_cancel_request_id(request) in canceled_req_ids_set)
+        ]
+
+        should_enqueue_responses = bool(canceled_requests)
+        if should_align_responses:
+            all_rank_cancel_flags = self.dist.tp_allgather_int64(
+                [int(should_enqueue_responses)])
+            should_enqueue_responses = any(
+                rank_flags[0] for rank_flags in all_rank_cancel_flags)
+            if should_enqueue_responses:
+                canceled_request_ids = self._allgather_adp_request_ids([
+                    self._get_cancel_request_id(request)
+                    for request in canceled_requests
+                ])
+                canceled_requests = [
+                    request for request in self.active_requests
+                    if request.is_generation_only_request() and
+                    self._get_cancel_request_id(request) in canceled_request_ids
+                ]
+
+        kv_cache_transceiver = getattr(self, "kv_cache_transceiver", None)
+        if kv_cache_transceiver is not None:
+            # Defer the cancellation response until the native transfer future has drained.
+            canceled_requests = [
+                request for request in canceled_requests
+                if not kv_cache_transceiver.has_pending_gen_transfer(request)
+            ]
+
+        if not canceled_requests:
+            if should_enqueue_responses:
+                self._enqueue_responses([])
+            return error_requests
+
+        canceled_request_ids = {
+            self._get_cancel_request_id(request)
+            for request in canceled_requests
+        }
+        canceled_responses = []
+        for request in canceled_requests:
+            if not request.is_finished_due_to_cancellation:
+                request.finish_by_reason(FinishReason.CANCELLED)
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            response = request.create_response(False, getattr(dist, "rank", 0))
+            if response is not None:
+                canceled_responses.append((request.py_request_id, response))
+
+        self.active_requests = [
+            request for request in self.active_requests
+            if request not in canceled_requests
+        ]
+        self.canceled_req_ids = [
+            request_id for request_id in canceled_req_ids
+            if request_id not in canceled_request_ids
+        ]
+
+        if should_enqueue_responses:
+            self._enqueue_responses(canceled_responses)
+
+        for request in canceled_requests:
+            self._terminate_request(request)
+
+        return [
+            request for request in error_requests
+            if request not in canceled_requests
+        ]
+
+    def _allgather_adp_request_ids(self, request_ids: List[int]) -> Set[int]:
+        gathered_request_ids = set()
+        index = 0
+        while True:
+            request_id = request_ids[index] if index < len(request_ids) else -1
+            all_rank_request_ids = self.dist.tp_allgather_int64([request_id])
+            has_request_id = False
+            for rank_request_ids in all_rank_request_ids:
+                if not rank_request_ids:
+                    continue
+                rank_request_id = rank_request_ids[0]
+                if rank_request_id != -1:
+                    gathered_request_ids.add(rank_request_id)
+                    has_request_id = True
+
+            if not has_request_id:
+                return gathered_request_ids
+            index += 1
+
+    def _cancel_adp_generation_transfer_error_requests(
+            self,
+            error_requests: List[LlmRequest]) -> Tuple[List[LlmRequest], bool]:
+        handled_error_requests = []
+        pending_request_ids = []
+        kv_cache_transceiver = getattr(self, "kv_cache_transceiver", None)
+        for request in error_requests:
+            if request.state != LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                if (kv_cache_transceiver is not None and
+                        kv_cache_transceiver.has_pending_gen_transfer(request)):
+                    pending_request_ids.append(request.py_request_id)
+                    continue
+                handled_error_requests.append(request)
+                continue
+
+            is_cancelled = (kv_cache_transceiver.cancel_request(request)
+                            if kv_cache_transceiver is not None else False)
+            if not is_cancelled:
+                logger.warning(
+                    "Generation transfer cancel_request returned false "
+                    "while handling ADP transfer error request_id=%s",
+                    request.py_request_id)
+                continue
+
+            request.py_kv_transfer_start_time = None
+            if (kv_cache_transceiver is not None
+                    and kv_cache_transceiver.has_pending_gen_transfer(request)):
+                pending_request_ids.append(request.py_request_id)
+                continue
+
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            handled_error_requests.append(request)
+        has_pending_transfer = False
+        if kv_cache_transceiver is not None:
+            pending_request_ids = self._allgather_adp_request_ids(
+                pending_request_ids)
+            has_pending_transfer = bool(pending_request_ids)
+            # All ADP ranks must agree to hold back requests whose generation transfer is still unwinding.
+            handled_error_requests = [
+                request for request in handled_error_requests
+                if request.py_request_id not in pending_request_ids
+            ]
+        return handled_error_requests, has_pending_transfer
+
+    def _filter_pending_generation_transfer_errors(
+            self, error_requests: List[LlmRequest]) -> List[LlmRequest]:
+        kv_cache_transceiver = getattr(self, "kv_cache_transceiver", None)
+        if kv_cache_transceiver is None:
+            return error_requests
+        return [
+            request for request in error_requests
+            if not kv_cache_transceiver.has_pending_gen_transfer(request)
+        ]
+
+    def _check_cache_transfer_errors(self,
+                                     error_msg_prefix: str,
+                                     align_across_adp: bool = False):
         """Common helper to check for and handle cache transfer errors."""
         error_requests = self._get_disagg_reqs_in_error_state()
+        is_aligned_adp_generation = (
+            align_across_adp and error_msg_prefix == "generation requests"
+            and getattr(self, "enable_attention_dp", False)
+            and getattr(self.dist, "world_size", 1) != 1)
+        if error_msg_prefix == "generation requests":
+            if not is_aligned_adp_generation:
+                error_requests = (
+                    self._filter_pending_generation_transfer_errors(
+                        error_requests))
+            error_requests = self._filter_canceled_gen_transfer_errors(
+                error_requests, align_across_adp=align_across_adp)
+        if is_aligned_adp_generation:
+            all_rank_error_flags = self.dist.tp_allgather_int64(
+                [int(bool(error_requests))])
+            if any(rank_flags[0] for rank_flags in all_rank_error_flags):
+                error_request_ids = self._allgather_adp_request_ids(
+                    [request.py_request_id for request in error_requests])
+                error_requests = [
+                    request for request in self.active_requests
+                    if request.py_request_id in error_request_ids
+                ]
+                error_requests, has_pending_transfer = (
+                    self._cancel_adp_generation_transfer_error_requests(
+                        error_requests))
+                error_requests = self._filter_canceled_gen_transfer_errors(
+                    error_requests, align_across_adp=align_across_adp)
+                has_ready_error = bool(
+                    error_requests) or not has_pending_transfer
+                all_rank_ready_error_flags = self.dist.tp_allgather_int64(
+                    [int(has_ready_error)])
+                if any(rank_flags[0]
+                       for rank_flags in all_rank_ready_error_flags):
+                    self._handle_adp_generation_transfer_errors(
+                        f"Error in kv cache transfer for {error_msg_prefix}",
+                        error_requests)
+            return
+
         if error_requests:
             self._handle_errors(
                 f"Error in kv cache transfer for {error_msg_prefix}",
@@ -3017,8 +3512,10 @@ class PyExecutor:
         for request_id in completed_req_ids:
 
             if request_id not in requests_in_transfer:
-                logger.warning(
-                    f"Request {request_id} not found in transfer manager")
+                logger.debug(
+                    "Ignoring late context transfer completion for request_id=%s already cleaned up locally",
+                    request_id,
+                )
                 continue
 
             request = requests_in_transfer[request_id]
@@ -3040,13 +3537,46 @@ class PyExecutor:
                     request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
 
                     self._end_transfer_and_maybe_terminate(request)
+                else:
+                    elapsed_ms = None
+                    if request.py_kv_transfer_start_time is not None:
+                        elapsed_ms = (time.time() -
+                                      request.py_kv_transfer_start_time) * 1000
+                    request.py_kv_transfer_start_time = None
+                    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                    self._end_transfer_and_maybe_terminate(request)
+                    logger.warning(
+                        "Context transfer cancel_request returned false "
+                        "request_id=%s state=%s elapsed_ms=%s requests_in_transfer_count=%s "
+                        "completed_req_ids=%s",
+                        request_id,
+                        request.state,
+                        f"{elapsed_ms:.3f}"
+                        if elapsed_ms is not None else "None",
+                        len(requests_in_transfer),
+                        sorted(completed_req_ids),
+                    )
+
+        requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
+        )
+        if requests_in_transfer:
+            reason = ("context_transfer_wait"
+                      if atLeastNum > 0 else "context_transfer_poll")
+            self._maybe_log_disagg_transfer_backpressure(
+                reason, at_least_num=atLeastNum)
 
         self._check_cache_transfer_errors("context requests")
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
-    def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
+    def _check_disagg_gen_cache_transfer_status(
+            self, atLeastNum: int = 0, align_errors_across_adp: bool = False):
         self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
-        self._check_cache_transfer_errors("generation requests")
+        for request in self.active_requests:
+            if (request.py_kv_transfer_timed_out and request.state
+                    == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE):
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+        self._check_cache_transfer_errors(
+            "generation requests", align_across_adp=align_errors_across_adp)
 
     def _forward_step(
             self,
@@ -3245,6 +3775,23 @@ class PyExecutor:
         for request in failed_requests:
             self._terminate_request(request)
 
+    def _handle_adp_generation_transfer_errors(self, error_msg: str,
+                                               requests: List[LlmRequest]):
+        error_response_payloads = []
+        for request in requests:
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            error_response_payloads.append(
+                (request.py_request_id, request.py_client_id, error_msg))
+
+        self.active_requests = [
+            request for request in self.active_requests
+            if request not in requests
+        ]
+        self._enqueue_adp_generation_transfer_error_responses(
+            error_response_payloads)
+        for request in requests:
+            self._terminate_request(request)
+
     def _terminate_request(self, request: LlmRequest):
         if self._disagg_pp_termination_handler is not None:
             self._disagg_pp_termination_handler.terminate(request)
@@ -3276,7 +3823,12 @@ class PyExecutor:
         if not self._is_request_in_transmission(request):
             return True
 
-        return self.kv_cache_transceiver.cancel_request(request)
+        is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+        if (is_cancelled and request.state
+                == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS and
+                self.kv_cache_transceiver.has_pending_gen_transfer(request)):
+            return False
+        return is_cancelled
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
@@ -3291,7 +3843,7 @@ class PyExecutor:
 
         still_pending_canceled_ids = []
         for request in self.active_requests:
-            req_id = request.py_request_id if not request.is_child else request.parent_request_id
+            req_id = self._get_cancel_request_id(request)
             if req_id not in canceled_req_ids_set:
                 continue
 
@@ -3325,6 +3877,37 @@ class PyExecutor:
                         if resp is not None:
                             gather_responses.extend(resp)
                     responses = gather_responses
+        self._enqueue_local_responses(responses)
+
+    def _enqueue_adp_generation_transfer_error_responses(
+            self, response_payloads: Iterable[Tuple[int, Optional[int], str]]):
+        if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
+            return
+
+        response_payloads = list(response_payloads)
+        if not self.gather_all_responses:
+            response_payloads_list = self.dist.tp_gather(response_payloads)
+        else:
+            response_payloads_list = self.dist.allgather(response_payloads)
+
+        if self.dist.rank == 0 or self.gather_all_responses:
+            gathered_response_payloads = []
+            if response_payloads_list is not None:
+                for rank_response_payloads in response_payloads_list:
+                    if rank_response_payloads is not None:
+                        gathered_response_payloads.extend(
+                            rank_response_payloads)
+            responses = [
+                (req_id,
+                 LlmResponse(request_id=req_id,
+                             error_msg=error_msg,
+                             client_id=client_id))
+                for req_id, client_id, error_msg in gathered_response_payloads
+            ]
+            self._enqueue_local_responses(responses)
+
+    def _enqueue_local_responses(self, responses: Iterable[Tuple[int,
+                                                                 LlmResponse]]):
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
@@ -3398,11 +3981,17 @@ class PyExecutor:
 
             # Check if generation request needs cleanup due to KV cache transfer timeout
             if request.py_kv_transfer_timed_out:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                if is_cancelled:
-                    self._handle_errors(
-                        error_msg=f"Request {request.py_request_id} timed out",
-                        requests=[request])
+                if request.state != LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                    if (getattr(self, "enable_attention_dp", False)
+                            and getattr(self.dist, "world_size", 1) != 1):
+                        new_active_requests.append(request)
+                    else:
+                        self._handle_errors(
+                            error_msg=
+                            f"Request {request.py_request_id} timed out",
+                            requests=[request])
+                else:
+                    new_active_requests.append(request)
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:

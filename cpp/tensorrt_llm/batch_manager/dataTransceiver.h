@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,9 +16,12 @@
  */
 
 #pragma once
+#include <atomic>
 #include <fstream>
 #include <future>
 #include <map>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -54,6 +57,12 @@ using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using BlockKey = tensorrt_llm::batch_manager::kv_cache_manager::BlockKey;
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 
+struct TransferStatusFuture
+{
+    std::future<void> future;
+    std::shared_ptr<std::atomic<bool>> hasError;
+};
+
 class TransferSession
 {
 public:
@@ -84,7 +93,8 @@ public:
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
         executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
-        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
+        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false,
+        std::shared_ptr<std::atomic<bool>> transferTerminateFlag = nullptr)
         : mConnections(std::move(connections))
         , mCounterPartRanks(std::move(counterPartRanks))
         , mDataContext(std::move(dataContext))
@@ -92,6 +102,7 @@ public:
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
         , mRequest(llmRequest)
+        , mTransferTerminateFlag(std::move(transferTerminateFlag))
         , mIndexFromEnd(indexFromEnd)
         , mLastBlockKey(lastBlockKey)
     {
@@ -108,6 +119,13 @@ public:
     void setConnection(size_t idx, Connection const* conn);
 
     [[nodiscard]] DataContext const& getDataContext() const;
+
+    [[nodiscard]] std::atomic<bool> const& getTransferTerminate() const
+    {
+        return mDataContext.getTransferTerminate();
+    }
+
+    void terminateTransfer() noexcept;
 
     [[nodiscard]] executor::DataTransceiverState const& getSelfState() const;
 
@@ -160,6 +178,7 @@ private:
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
     std::unique_ptr<KVCacheTimes> mTimes;
+    std::shared_ptr<std::atomic<bool>> mTransferTerminateFlag;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
 };
@@ -275,7 +294,7 @@ public:
 
     /// @brief Receive request information.
     /// @param llmRequest The request object to which the data belongs.
-    virtual RequestInfo recvRequestInfo();
+    virtual std::optional<RequestInfo> recvRequestInfo();
 
     /// @brief Cancel the request.
     /// @param requestId The ID used in the context phase of the current request.
@@ -317,6 +336,8 @@ public:
     /// data for this request should remain intact only after future synchronization.
     /// @return Once the data is fully received, the future object will become valid.
     [[nodiscard]] virtual std::future<void> receiveAsync(LlmRequest& llmRequest) const;
+
+    [[nodiscard]] TransferStatusFuture receiveAsyncWithStatus(LlmRequest& llmRequest) const;
 
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 

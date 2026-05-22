@@ -19,6 +19,7 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        SchedulerConfig, SkipSoftmaxAttentionConfig,
                        TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
                        UserProvidedDecodingConfig)
+from .llm_args import PythonCapacitySchedulerPolicy
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
@@ -58,6 +59,7 @@ __all__ = [
     'ExtendedRuntimePerfKnobConfig',
     'BatchingType',
     'ContextChunkingPolicy',
+    'PythonCapacitySchedulerPolicy',
     'DynamicBatchConfig',
     'CacheTransceiverConfig',
     'NGramDecodingConfig',

@@ -1848,6 +1848,12 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
         return getattr(_ContextChunkingPolicy, self.value)
 
 
+class PythonCapacitySchedulerPolicy(StrEnum):
+    """Python-scheduler-only capacity scheduler policy."""
+
+    SHORTEST_MISSED_BLOCKS_FIRST = "SHORTEST_MISSED_BLOCKS_FIRST"
+
+
 class WaitingQueuePolicy(StrEnum):
     """Waiting queue scheduling policy for managing pending requests."""
 
@@ -1892,6 +1898,13 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     context_chunking_policy: Optional[ContextChunkingPolicy] = Field(
         default=None, description="The context chunking policy to use")
 
+    python_capacity_scheduler_policy: Optional[
+        PythonCapacitySchedulerPolicy] = Field(
+            default=None,
+            description=
+            "The Python-only capacity scheduler policy to use. This requires "
+            "use_python_scheduler=True and does not affect the C++ scheduler.")
+
     dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
         default=None,
         description=
@@ -1905,6 +1918,15 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     use_python_scheduler: bool = Field(
         default=False,
         description="Use pure-Python scheduler instead of C++ scheduler.")
+
+    @model_validator(mode="after")
+    def _validate_python_only_capacity_scheduler_policy(self):
+        if (self.python_capacity_scheduler_policy is not None
+                and not self.use_python_scheduler):
+            raise ValueError(
+                "Python-only python_capacity_scheduler_policy values require use_python_scheduler=True."
+            )
+        return self
 
     def _to_pybind(self):
         return _SchedulerConfig(

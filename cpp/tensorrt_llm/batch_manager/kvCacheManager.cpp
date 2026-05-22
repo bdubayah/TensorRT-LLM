@@ -25,6 +25,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -1074,6 +1075,16 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     {
         // Offload block in primary memory before repurposing
         auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
+
+        // Claim both blocks BEFORE the swap so that getCacheLevel() returns the
+        // correct pre-swap level.  Previously the claims happened after the swap,
+        // causing claimBlock to erase from the wrong per-level free queue (UB) and
+        // to modify the wrong level's free-block counter — the root cause of
+        // getNumFreeBlocks() exceeding getMaxNumBlocks() in disagg/prefill mode
+        // (GitHub #11879).
+        mEvictionPolicy->claimBlock(block);        // primary block → claimed from primary queue
+        mEvictionPolicy->claimBlock(offloadBlock); // secondary block → claimed from secondary queue
+
         mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);
@@ -1084,11 +1095,12 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
                 tle::KVCacheUpdatedData(block->getHash()).cacheLevelUpdated(kPrimaryLevel, kSecondaryLevel),
                 mWindowSize);
         }
-        // Update the block as a secondary block (maintaining its priority)
-        mEvictionPolicy->claimBlock(block);
-        // Release the block into secondary block queue
+        // Release block (now secondary after swap) into secondary block queue,
+        // preserving its existing priority.
         mEvictionPolicy->releaseBlock(block);
-        // We have the offloaded block as the block to use now.
+        // offloadBlock (now primary after swap) is already claimed above.
+        // The final claimBlock() below will be a no-op for the queue but still
+        // applies the caller's priority/durationMs.
         block = offloadBlock;
     }
 
@@ -1772,6 +1784,15 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             }
             if (pinBlocks)
             {
+                // If the block has no refs it sits in the eviction policy's free
+                // queue. Claim it first so that the later unpinBlocksById /
+                // releaseBlock cycle does not create a duplicate queue entry.
+                // Pass the block's existing priority and duration so that
+                // claimBlock does not clear its retention/expiry metadata.
+                if (!searchRoot->hasRefs())
+                {
+                    mEvictionPolicy->claimBlock(searchRoot, searchRoot->getPriority(), searchRoot->getDurationMs());
+                }
                 searchRoot->incRefCount();
                 pinnedBlockIds.push_back(searchRoot->getBlockId());
             }

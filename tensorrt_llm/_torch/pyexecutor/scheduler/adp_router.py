@@ -92,7 +92,7 @@ class ADPRouter(ABC):
                 new-request info (e.g. KV-cache-aware routing).
         """
         local_state = self.create_rank_state(active_requests, new_requests or [])
-        responses = self.dist.tp_allgather(local_state.serialize())
+        responses = self.dist.tp_allgather_int64(local_state.serialize())
         return [RankState.deserialize(data=resp) for resp in responses]
 
     @abstractmethod
