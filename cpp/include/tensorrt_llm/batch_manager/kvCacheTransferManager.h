@@ -81,7 +81,8 @@ private:
         [[nodiscard]] std::size_t operator()(PendingTransferKey const& key) const;
     };
 
-    using PendingTransferMap = std::unordered_map<PendingTransferKey, tr::CudaEvent, PendingTransferKeyHash>;
+    using PendingReadMap = std::unordered_map<PendingTransferKey, std::vector<tr::CudaEvent>, PendingTransferKeyHash>;
+    using PendingWriteMap = std::unordered_map<PendingTransferKey, tr::CudaEvent, PendingTransferKeyHash>;
 
     //! \brief Get pointer to pool specified by cache block.
     tr::ITensor::SharedPtr computeBlockPointer(
@@ -117,8 +118,12 @@ private:
 
     void waitForPendingWrite(PendingTransferKey const& key, tr::CudaStream const& stream, bool eraseAfterWait);
 
+    static void waitForPendingReads(
+        PendingReadMap& pendingReads, PendingTransferKey const& key, tr::CudaStream const& stream,
+        bool eraseAfterWait);
+
     static void waitForPendingTransfer(
-        PendingTransferMap& pendingTransfers, PendingTransferKey const& key, tr::CudaStream const& stream,
+        PendingWriteMap& pendingTransfers, PendingTransferKey const& key, tr::CudaStream const& stream,
         bool eraseAfterWait);
 
     void recordPendingRead(PendingTransferKey const& key, tr::CudaStream const& stream);
@@ -126,7 +131,7 @@ private:
     void recordPendingWrite(PendingTransferKey const& key, tr::CudaStream const& stream);
 
     static void recordPendingTransfer(
-        PendingTransferMap& pendingTransfers, PendingTransferKey const& key, tr::CudaStream const& stream);
+        PendingWriteMap& pendingTransfers, PendingTransferKey const& key, tr::CudaStream const& stream);
 
     runtime::BufferManager mBufferManager;
     runtime::BufferManager mOnboardManager;
@@ -135,8 +140,9 @@ private:
 
     // Track reads and writes for blocks. The key identifies a raw memory block
     // by both offset and memory level so primary and secondary blocks do not alias.
-    PendingTransferMap mPendingReads;
-    PendingTransferMap mPendingWrites;
+    // Multiple pending reads may target the same source block, but writes remain exclusive.
+    PendingReadMap mPendingReads;
+    PendingWriteMap mPendingWrites;
     bool mEnableTpMlaReplicatedHostOffload;
     std::set<int> mTpGroupRanks;
     std::optional<TpHostOffloadTopology> mTpHostOffloadTopology;

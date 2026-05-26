@@ -168,8 +168,25 @@ int KVCacheTransferManager::tpGroupRankForWorldRank(int worldRank) const
     return static_cast<int>(std::distance(mTpGroupRanks.begin(), rootIt));
 }
 
+void KVCacheTransferManager::waitForPendingReads(
+    PendingReadMap& pendingReads, PendingTransferKey const& key, tr::CudaStream const& stream, bool eraseAfterWait)
+{
+    auto pendingReadItr = pendingReads.find(key);
+    if (pendingReadItr != pendingReads.end())
+    {
+        for (auto const& pendingRead : pendingReadItr->second)
+        {
+            stream.wait(pendingRead);
+        }
+        if (eraseAfterWait)
+        {
+            pendingReads.erase(pendingReadItr);
+        }
+    }
+}
+
 void KVCacheTransferManager::waitForPendingTransfer(
-    PendingTransferMap& pendingTransfers, PendingTransferKey const& key, tr::CudaStream const& stream,
+    PendingWriteMap& pendingTransfers, PendingTransferKey const& key, tr::CudaStream const& stream,
     bool eraseAfterWait)
 {
     auto pendingTransferItr = pendingTransfers.find(key);
@@ -186,7 +203,7 @@ void KVCacheTransferManager::waitForPendingTransfer(
 void KVCacheTransferManager::waitForPendingRead(
     PendingTransferKey const& key, tr::CudaStream const& stream, bool eraseAfterWait)
 {
-    waitForPendingTransfer(mPendingReads, key, stream, eraseAfterWait);
+    waitForPendingReads(mPendingReads, key, stream, eraseAfterWait);
 }
 
 void KVCacheTransferManager::waitForPendingWrite(
@@ -196,16 +213,18 @@ void KVCacheTransferManager::waitForPendingWrite(
 }
 
 void KVCacheTransferManager::recordPendingTransfer(
-    PendingTransferMap& pendingTransfers, PendingTransferKey const& key, tr::CudaStream const& stream)
+    PendingWriteMap& pendingTransfers, PendingTransferKey const& key, tr::CudaStream const& stream)
 {
     auto [pendingTransferItr, inserted] = pendingTransfers.emplace(key, tr::CudaEvent());
-    TLLM_CHECK_WITH_INFO(inserted, "Previous pending transfer event still exists for the block.");
+    TLLM_CHECK_WITH_INFO(inserted, "Previous pending write event still exists for the block.");
     stream.record(pendingTransferItr->second);
 }
 
 void KVCacheTransferManager::recordPendingRead(PendingTransferKey const& key, tr::CudaStream const& stream)
 {
-    recordPendingTransfer(mPendingReads, key, stream);
+    auto& pendingReads = mPendingReads[key];
+    pendingReads.emplace_back();
+    stream.record(pendingReads.back());
 }
 
 void KVCacheTransferManager::recordPendingWrite(PendingTransferKey const& key, tr::CudaStream const& stream)
@@ -408,8 +427,8 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
         auto const ownerRank = blockMappingForSecondaryBlock(offloadBlock).ownerRank;
         if (mWorldRank != ownerRank)
         {
-            // This is the dedupe point for replicated TP MLA host offload: all ranks see the replicated secondary block,
-            // but only the deterministic owner rank writes the compact host-offload slot.
+            // This is the dedupe point for replicated TP MLA host offload: all ranks see the replicated secondary
+            // block, but only the deterministic owner rank writes the compact host-offload slot.
             return;
         }
     }
